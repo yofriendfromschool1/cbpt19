@@ -1,6 +1,8 @@
 <#
 ================================================================================
  cbptwindows.ps1 -- CyberPatriot Windows image triage + hardening helper
+Usage:       Right-click PowerShell -> Run as Administrator -> .\windows_script.ps1
+If blocked, right click file, properties, Ublock. If still blocked, run this in powershell: Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
 ================================================================================
  grew out of the team checklist over a bunch of practice rounds. it is NOT
  a magic point button: it automates the boring baseline every team can do,
