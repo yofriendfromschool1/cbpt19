@@ -66,8 +66,8 @@ If blocked, right click file, properties, Unblock. If still blocked, run this in
    sections: recon users registry network services defender apps files
              verify report all menu guide
 
-   the users section reconciles local accounts against users.txt and
-   admins.txt placed next to this script (one name per line, copied from
+   the users section reconciles local accounts against users.txt, admins.txt,
+   and groups.txt placed next to this script (one name per line, copied from
    the README). templates get created on first run if they are missing.
 
  --------------------------------------------------------------------------------
@@ -80,6 +80,15 @@ If blocked, right click file, properties, Unblock. If still blocked, run this in
           in recon, -DryRun, needs-review.txt, the master hints guide.
    1.0.1  Get-Service .StartType does not exist on PS 5.1 -> start types
           now go through sc.exe with a cmdlet fallback.
+   1.2.0  added User Rights Assignment audit + remediation, groups.txt +
+          interactive group helper, non-default/hidden share detection +
+          removal, WDigest real path + DisableDomainCreds=1 + RDP non-enable
+          fixes, full SmartScreen + Windows Update + Office + null-session
+          registry hardening, optional Windows features disabling, Windows
+          OpenSSH hardening, Appx/winget/outdated-app + Invoke-Software,
+          non-blocking Defender QuickScan (-SkipScan), targeted fast
+          Zone.Identifier/recent-files/Invoke-Files scans, PSReadLine history
+          + netcat/tool binary hunt, and expanded Invoke-Verify coverage.
 
  known gaps / TODO:
    - domain controller: password policy needs the Default Domain Policy
@@ -93,7 +102,7 @@ If blocked, right click file, properties, Unblock. If still blocked, run this in
 [CmdletBinding()]
 param(
     [ValidateSet('menu','guide','all','recon','users','registry',
-                 'network','services','defender','apps','files','verify','report')]
+                 'network','services','defender','apps','software','files','verify','report')]
     [string]$Phase = 'menu',
 
     [switch]$Aggressive,
@@ -102,6 +111,7 @@ param(
     [switch]$NoBackup,
     [switch]$Force,
     [switch]$Hints,
+    [switch]$SkipScan,
 
     [string]$Restore = '',
     [string]$WorkRoot = 'C:\CP\cbptwindows',
@@ -111,7 +121,7 @@ param(
 # ------------------------------------------------------------------------------
 # globals
 # ------------------------------------------------------------------------------
-$script:Version    = '1.0.1'
+$script:Version    = '1.2.0'
 $script:Stamp      = Get-Date -Format 'yyyyMMdd-HHmmss'
 $script:Root       = $WorkRoot
 $script:EvDir      = Join-Path $WorkRoot 'evidence'
@@ -122,6 +132,9 @@ $script:Findings   = New-Object System.Collections.Generic.List[object]
 $script:Changed    = New-Object System.Collections.Generic.List[object]
 $script:Hostname   = $env:COMPUTERNAME
 $script:Dry        = [bool]$DryRun
+$script:Agg        = [bool]$Aggressive
+$script:Para       = [bool]$Paranoid
+$script:BackupDone = $false
 
 # services that must keep working. EDIT PER IMAGE once you have read the
 # README. anything in here is never stopped or disabled by the service pass.
@@ -200,7 +213,7 @@ function Test-Admin {
 function Confirm-CP {
     param([string]$Question)
     if ($Force)   { return $true }
-    if ($Paranoid -or $script:Dry) { return $false }
+    if ($script:Para -or $script:Dry) { return $false }
     Write-Host ''
     Write-Host ("  !! " + $Question) -ForegroundColor Yellow
     try {
@@ -258,26 +271,32 @@ function Set-CPReg {
     param(
         [Parameter(Mandatory)][string]$Path,
         [Parameter(Mandatory)][string]$Name,
-        [Parameter(Mandatory)]$Value,
+        [AllowEmptyCollection()][Parameter(Mandatory)]$Value,
         [ValidateSet('DWord','QWord','String','ExpandString','MultiString','Binary')]
         [string]$Type = 'DWord',
         [string]$Id = '',
         [string]$Area = 'Registry'
     )
-    if ($Paranoid) { return $false }
-    if ($script:Dry) { Write-CP ("[dry-run] reg {0}\{1} = {2}" -f $Path, $Name, $Value) 'warn'; return $false }
+    if ($script:Para) { return $false }
+    if ($script:Dry) { Write-CP ("[dry-run] reg {0}\{1} = {2}" -f $Path, $Name, ($Value -join ',')) 'warn'; return $false }
     try {
         if (-not (Test-Path $Path)) { New-Item -Path $Path -Force | Out-Null }
         $old = $null
-        try { $old = (Get-ItemProperty -Path $Path -Name $Name -ErrorAction Stop).$Name } catch {}
-        if (("$old") -eq ("$Value")) {
+        $hadOld = $false
+        try { $old = (Get-ItemProperty -Path $Path -Name $Name -ErrorAction Stop).$Name; $hadOld = $true } catch {}
+        if ($Type -eq 'MultiString') {
+            if ($hadOld -and ((@($old) -join '|') -eq (@($Value) -join '|'))) {
+                if ($Id) { Add-Finding -Id $Id -Area $Area -Status 'PASS' -Detail "$Name already correct" }
+                return $true
+            }
+        } elseif ($hadOld -and (("$old") -eq ("$Value"))) {
             if ($Id) { Add-Finding -Id $Id -Area $Area -Status 'PASS' -Detail "$Name already correct" }
             return $true
         }
         Backup-RegKey $Path
         Set-ItemProperty -Path $Path -Name $Name -Value $Value -Type $Type -ErrorAction Stop
-        Register-Change -What ("$Path\$Name") -Old ("$old") -New ("$Value")
-        if ($Id) { Add-Finding -Id $Id -Area $Area -Status 'PASS' -Detail "$Name set to $Value" }
+        Register-Change -What ("$Path\$Name") -Old ("$old") -New ((@($Value) -join ','))
+        if ($Id) { Add-Finding -Id $Id -Area $Area -Status 'PASS' -Detail "$Name set to $(@($Value) -join ',')" }
         return $true
     } catch {
         if ($Id) {
@@ -315,7 +334,7 @@ function Get-CPStartType {
 
 function Set-CPStartType {
     param([string]$Name, [ValidateSet('Automatic','Manual','Disabled')][string]$Type)
-    if ($Paranoid -or $script:Dry) {
+    if ($script:Para -or $script:Dry) {
         if ($script:Dry) { Write-CP ("[dry-run] sc config {0} start= {1}" -f $Name, $Type) 'warn' }
         return $false
     }
@@ -414,17 +433,67 @@ function Get-SeceditInf {
     return $tmp
 }
 
+function ConvertFrom-CPSid {
+    param([string]$Entry)
+    $raw = $Entry.Trim()
+    if (-not $raw) { return '' }
+    if ($raw.StartsWith('*')) { $raw = $raw.Substring(1) }
+    if ($raw -match '^S-\d+-\d+') {
+        try {
+            $sidObj = New-Object System.Security.Principal.SecurityIdentifier($raw)
+            return $sidObj.Translate([System.Security.Principal.NTAccount]).Value
+        } catch { return $raw }
+    }
+    return $raw
+}
+
+function Get-CPUserRights {
+    param([string]$InfPath = '')
+    $cleanup = $false
+    if (-not $InfPath) {
+        $InfPath = Get-SeceditInf
+        $cleanup = $true
+    }
+    $list = New-Object System.Collections.Generic.List[object]
+    $inPriv = $false
+    foreach ($line in (Get-Content -LiteralPath $InfPath -ErrorAction SilentlyContinue)) {
+        $t = $line.Trim()
+        if ($t -match '^\[(.+)\]$') {
+            $inPriv = ($Matches[1] -ieq 'Privilege Rights')
+            continue
+        }
+        if ($inPriv -and $t -match '^([^=]+)=(.*)$') {
+            $right = $Matches[1].Trim()
+            $rawVal = $Matches[2].Trim()
+            $entries = @($rawVal -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+            $resolved = @($entries | ForEach-Object { ConvertFrom-CPSid $_ })
+            $list.Add([pscustomobject]@{
+                Right       = $right
+                RawEntries  = $entries
+                Names       = $resolved
+                RawValue    = $rawVal
+            })
+        }
+    }
+    if ($cleanup) { Remove-Item -LiteralPath $InfPath -Force -ErrorAction SilentlyContinue }
+    return ,$list
+}
+
 function Set-SeceditValue {
     param(
         [System.Collections.Generic.List[string]]$Lines,
         [string]$Section, [string]$Key, [string]$Value
     )
-    $inSec = $false; $lastIdx = -1
+    $inSec = $false; $lastIdx = -1; $secIdx = -1
     for ($i = 0; $i -lt $Lines.Count; $i++) {
         $l = $Lines[$i].Trim()
         if ($l -match '^\[(.+)\]$') {
-            if ($inSec -and $lastIdx -ge 0) { $Lines.Insert($lastIdx + 1, "$Key = $Value"); return $true }
-            $inSec = ($Matches[1] -ieq $Section); $lastIdx = -1; continue
+            if ($inSec) {
+                $ins = if ($lastIdx -ge 0) { $lastIdx + 1 } else { $secIdx + 1 }
+                $Lines.Insert($ins, "$Key = $Value")
+                return $true
+            }
+            $inSec = ($Matches[1] -ieq $Section); $lastIdx = -1; $secIdx = $i; continue
         }
         if ($inSec) {
             if ($l -match '^([^=]+)=(.*)$') {
@@ -433,14 +502,18 @@ function Set-SeceditValue {
             }
         }
     }
-    if ($inSec -and $lastIdx -ge 0) { $Lines.Insert($lastIdx + 1, "$Key = $Value"); return $true }
+    if ($inSec) {
+        $ins = if ($lastIdx -ge 0) { $lastIdx + 1 } else { $secIdx + 1 }
+        $Lines.Insert($ins, "$Key = $Value")
+        return $true
+    }
     $Lines.Add(''); $Lines.Add("[$Section]"); $Lines.Add("$Key = $Value")
     return $true
 }
 
 function Apply-SeceditInf {
     param([string]$InfPath)
-    if ($Paranoid) { return $true }
+    if ($script:Para) { return $true }
     if ($script:Dry) { Write-CP ("[dry-run] secedit /configure with {0}" -f $InfPath) 'warn'; return $false }
     $db = Join-Path $env:TEMP ("gdn_appl_" + [guid]::NewGuid().ToString('N') + '.sdb')
     $r = & secedit.exe /configure /db "$db" /cfg "$InfPath" /areas SECURITYPOLICY USER_RIGHTS /quiet 2>&1
@@ -452,6 +525,8 @@ function Apply-SeceditInf {
 # backup / restore
 # ------------------------------------------------------------------------------
 function New-CPBackup {
+    param([switch]$ForceBackup)
+    if ($script:BackupDone -and -not $ForceBackup) { Write-CP "backup already taken this session ($script:BkDir)" 'info'; return }
     Write-Banner 'BACKUP'
     if ($NoBackup) { Write-CP 'skipped (-NoBackup)' 'warn'; return }
     New-Item -ItemType Directory -Path $script:BkDir -Force | Out-Null
@@ -510,6 +585,7 @@ function New-CPBackup {
         & wevtutil gl Security > (Join-Path $b 'evtlog-security.txt') 2>&1
         $null = & gpresult /h (Join-Path $b 'gpresult.html') /f 2>&1
     }
+    $script:BackupDone = $true
     Write-CP ("backup complete ({0} files)" -f @(Get-ChildItem $b -Recurse -File -ErrorAction SilentlyContinue).Count) 'ok'
 }
 
@@ -714,7 +790,7 @@ function Invoke-Recon {
     }
 
     Invoke-CP 'group membership' {
-        $g = @()
+        $g = New-Object System.Collections.Generic.List[object]
         foreach ($grp in @('Administrators','Users','Guests','Remote Desktop Users','Power Users',
                            'Backup Operators','Account Operators','Print Operators','Server Operators',
                            'Replicators','Cryptographic Operators','Network Configuration Operators',
@@ -723,7 +799,7 @@ function Invoke-Recon {
             try {
                 $m = @(Get-LocalGroupMember -Group $grp -ErrorAction Stop)
                 foreach ($x in $m) {
-                    $g += [pscustomobject]@{ Group=$grp; Member=$x.Name; SID=$x.SID.Value; Type=$x.ObjectClass }
+                    $g.Add([pscustomobject]@{ Group=$grp; Member=$x.Name; SID=$x.SID.Value; Type=$x.ObjectClass })
                 }
                 if ($m.Count -gt 0 -and $grp -notin @('Users','Guests','Administrators','IIS_IUSRS')) {
                     Add-Finding -Id "GRP-$grp" -Area 'Accounts' -Status 'WARN' `
@@ -735,14 +811,58 @@ function Invoke-Recon {
         $g | Export-Csv (Join-Path $ev '11-groups.csv') -NoTypeInformation
     }
 
+    Invoke-CP 'user rights assignment audit' {
+        $ur = Get-CPUserRights
+        $ur | Select-Object Right,@{n='Accounts';e={$_.Names -join '; '}},RawValue |
+            Export-Csv (Join-Path $ev '12-user-rights.csv') -NoTypeInformation
+        $adminNames = @(Get-AdminMemberNames)
+        $sensRights = @(
+            'SeSecurityPrivilege','SeTakeOwnershipPrivilege','SeDebugPrivilege','SeTcbPrivilege',
+            'SeBackupPrivilege','SeRestorePrivilege','SeLoadDriverPrivilege','SeImpersonatePrivilege',
+            'SeAssignPrimaryTokenPrivilege','SeCreateTokenPrivilege','SeManageVolumePrivilege',
+            'SeRemoteShutdownPrivilege','SeCreatePermanentPrivilege','SeLockMemoryPrivilege',
+            'SeRelabelPrivilege','SeTrustedCredManAccessPrivilege','SeEnableDelegationPrivilege',
+            'SeSyncAgentPrivilege'
+        )
+        foreach ($entry in $ur) {
+            if ($entry.Right -notin $sensRights) { continue }
+            $badAccts = New-Object System.Collections.Generic.List[string]
+            foreach ($nm in $entry.Names) {
+                $short = ($nm -split '\\')[-1]
+                if ($short -match '^(Administrators|SYSTEM|LOCAL SERVICE|NETWORK SERVICE|SERVICE|WdiServiceHost)$') { continue }
+                if ($short -match '^(Everyone|Anonymous Logon|ANONYMOUS LOGON|Guest|Guests|Users|Authenticated Users)$') {
+                    $badAccts.Add($nm)
+                } elseif ($adminNames -notcontains $short) {
+                    $badAccts.Add($nm)
+                }
+            }
+            if ($badAccts.Count -gt 0) {
+                Add-Finding -Id "URIGHT-$($entry.Right)" -Area 'Policy' -Status 'FAIL' `
+                    -Detail "$($entry.Right) granted to: $($badAccts -join ', ')" `
+                    -Hint 'Non-admin user holding sensitive User Right (e.g. Manage auditing / Take ownership / Debug). Fix in Invoke-Users or secpol.msc.'
+            }
+        }
+        foreach ($entry in $ur) {
+            if ($entry.Right -in @('SeNetworkLogonRight','SeRemoteInteractiveLogonRight')) {
+                foreach ($nm in $entry.Names) {
+                    if ($nm -match '(?i)(^|\\)(Everyone|Guest|Guests|Anonymous Logon)$') {
+                        Add-Finding -Id "URIGHT-$($entry.Right)" -Area 'Policy' -Status 'FAIL' `
+                            -Detail "$($entry.Right) allows '$nm'" `
+                            -Hint 'Remove Everyone/Guest/Anonymous from network/RDP logon rights in secpol.msc.'
+                    }
+                }
+            }
+        }
+    }
+
     # ---- network --------------------------------------------------------
     Invoke-CP 'listening ports' {
-        $rows = @()
+        $rows = New-Object System.Collections.Generic.List[object]
         try {
             foreach ($x in (Get-NetTCPConnection -State Listen -ErrorAction Stop)) {
                 $procName = ''
                 try { $procName = (Get-Process -Id $x.OwningProcess -ErrorAction Stop).ProcessName } catch {}
-                $rows += [pscustomobject]@{ Proto='TCP'; LocalAddress=$x.LocalAddress; Port=$x.LocalPort; PID=$x.OwningProcess; Process=$procName }
+                $rows.Add([pscustomobject]@{ Proto='TCP'; LocalAddress=$x.LocalAddress; Port=$x.LocalPort; PID=$x.OwningProcess; Process=$procName })
             }
         } catch {
             # Get-NetTCPConnection missing on some old images -> parse netstat
@@ -755,7 +875,7 @@ function Invoke-Recon {
                 if ($la.LastIndexOf(':') -gt 0) { [void][int]::TryParse($la.Substring($la.LastIndexOf(':')+1), [ref]$lp) }
                 $pn = ''
                 try { $pn = (Get-Process -Id $bits[4] -ErrorAction Stop).ProcessName } catch {}
-                $rows += [pscustomobject]@{ Proto='TCP'; LocalAddress=$la; Port=$lp; PID=$bits[4]; Process=$pn }
+                $rows.Add([pscustomobject]@{ Proto='TCP'; LocalAddress=$la; Port=$lp; PID=$bits[4]; Process=$pn })
             }
         }
         $rows | Sort-Object Port -Unique | Export-Csv (Join-Path $ev '20-listening.csv') -NoTypeInformation
@@ -792,12 +912,12 @@ function Invoke-Recon {
             'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer\Run',
             'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
         )
-        $dump = @()
+        $dump = New-Object System.Collections.Generic.List[object]
         foreach ($k in $keys) {
             if (-not (Test-Path $k)) { continue }
             $p = Get-ItemProperty $k
             foreach ($n in ($p.PSObject.Properties | Where-Object { $_.Name -notmatch '^PS' })) {
-                $dump += [pscustomobject]@{ Key=$k; Name=$n.Name; Value=$n.Value }
+                $dump.Add([pscustomobject]@{ Key=$k; Name=$n.Name; Value=$n.Value })
                 if ($k -like '*Winlogon*' -and $n.Name -match '^(Shell|Userinit|System)$') {
                     $bad = $false
                     if ($n.Name -eq 'Shell'     -and "$($n.Value)" -notmatch '(?i)^explorer\.exe$') { $bad = $true }
@@ -921,20 +1041,86 @@ function Invoke-Recon {
     }
 
     # ---- malware hunt ----------------------------------------------------
-    Invoke-CP 'malware hunt: processes + sketchy locations' {
+    Invoke-CP 'malware hunt: processes + backdoor tools + ps profiles' {
         Get-Process | Sort-Object CPU -Descending |
             Select-Object -First 15 Name,Id,CPU,Path | Format-Table -Auto |
             Out-String -Width 220 | Set-Content (Join-Path $ev '35-top-processes.txt')
         Get-Content (Join-Path $ev '35-top-processes.txt') | ForEach-Object { Write-Host ("   " + $_) }
 
+        # full process command lines (catches nc -l -p / reverse shells / miners)
+        $procs = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)
+        $procs | Select-Object ProcessId,ParentProcessId,Name,ExecutablePath,CommandLine |
+            Export-Csv (Join-Path $ev '35-processes-full.csv') -NoTypeInformation
+        foreach ($pr in $procs) {
+            $cl = "$($pr.CommandLine)"
+            if ($cl -match '(?i)\b(nc|nc64|ncat|netcat|socat|xmrig|mimikatz|pwdump|fgdump)\b|\s-e\s+(cmd|powershell)|-enc\b') {
+                Add-Finding -Id "PROC-$($pr.ProcessId)" -Area 'Malware' -Status 'FAIL' `
+                    -Detail "suspicious process [$($pr.Name) PID $($pr.ProcessId)]: $cl" `
+                    -Hint 'Stop-Process -Id <PID> -Force, hash the binary, remove its persistence, and document it.'
+            }
+        }
+
+        # targeted fast hunt for known backdoor / pentest binaries
+        $toolNames = @('nc.exe','nc64.exe','ncat.exe','netcat.exe','socat.exe','mimikatz.exe',
+                       'psexec.exe','procdump.exe','chisel.exe','xmrig.exe','pwdump*.exe','fgdump.exe')
+        $toolRoots = New-Object System.Collections.Generic.List[string]
+        foreach ($tr in @('C:\','C:\Tools','C:\Temp','C:\Windows\Temp','C:\ProgramData','C:\Users\Public')) {
+            if (Test-Path $tr) { $toolRoots.Add($tr) }
+        }
+        foreach ($u in (Get-ChildItem C:\Users -Directory -ErrorAction SilentlyContinue)) {
+            if ($u.Name -in @('Default','Default User','All Users')) { continue }
+            foreach ($sub in @('Desktop','Downloads','Documents')) {
+                $sp = Join-Path $u.FullName $sub
+                if (Test-Path $sp) { $toolRoots.Add($sp) }
+            }
+        }
+        $toolHits = New-Object System.Collections.Generic.List[object]
+        foreach ($tr in $toolRoots) {
+            $depthArgs = if ($tr -eq 'C:\') { @{ Depth = 1 } } else { @{} }
+            foreach ($f in @(Get-ChildItem -Path $tr -File -Include $toolNames @depthArgs -Recurse:($tr -ne 'C:\') -ErrorAction SilentlyContinue)) {
+                $toolHits.Add([pscustomobject]@{ FullName=$f.FullName; Length=$f.Length; LastWriteTime=$f.LastWriteTime })
+            }
+        }
+        $toolHits | Sort-Object FullName -Unique | Export-Csv (Join-Path $ev '37-tool-binaries.csv') -NoTypeInformation
+        if ($toolHits.Count -gt 0) {
+            Add-Finding -Id 'MAL-TOOLS' -Area 'Malware' -Status 'FAIL' `
+                -Detail "$($toolHits.Count) backdoor/hacking binary(ies) found (e.g. $($toolHits[0].FullName))" `
+                -Hint 'Check evidence\37-tool-binaries.csv -- netcat/ncat/mimikatz drops are classic high-point backdoors.'
+        } else {
+            Add-Finding -Id 'MAL-TOOLS' -Area 'Malware' -Status 'PASS' -Detail 'no netcat/mimikatz/psexec tool binaries in common paths'
+        }
+
+        # PowerShell profile persistence check
+        $psProfiles = New-Object System.Collections.Generic.List[string]
+        foreach ($pp in @("$env:windir\System32\WindowsPowerShell\v1.0\profile.ps1",
+                          "$env:windir\System32\WindowsPowerShell\v1.0\Microsoft.PowerShell_profile.ps1")) {
+            if (Test-Path $pp) { $psProfiles.Add($pp) }
+        }
+        foreach ($u in (Get-ChildItem C:\Users -Directory -ErrorAction SilentlyContinue)) {
+            foreach ($pf in @('profile.ps1','Microsoft.PowerShell_profile.ps1')) {
+                $up = Join-Path $u.FullName ("Documents\WindowsPowerShell\" + $pf)
+                if (Test-Path $up) { $psProfiles.Add($up) }
+            }
+        }
+        foreach ($pf in $psProfiles) {
+            $body = Get-Content -LiteralPath $pf -Raw -ErrorAction SilentlyContinue
+            if ($body -and $body.Trim().Length -gt 0) {
+                Add-Finding -Id 'PERSIST-PSPROFILE' -Area 'Persistence' -Status 'WARN' `
+                    -Detail "non-empty PowerShell profile: $pf" `
+                    -Hint 'Inspect PowerShell profile scripts -- attackers use them to auto-launch payloads on shell startup.'
+            }
+        }
+
         # round "malware" is usually fake and AV misses it. the binary lives
         # somewhere writable -- temp, appdata, public, downloads. that is the
         # whole list of hiding places that matter.
         $sketchy = @("$env:TEMP", 'C:\Windows\Temp', 'C:\Users\Public', "$env:APPDATA", "$env:LOCALAPPDATA\Temp")
-        $found = @()
+        $found = New-Object System.Collections.Generic.List[object]
         foreach ($d in $sketchy) {
-            $found += @(Get-ChildItem $d -Recurse -Include *.exe,*.bat,*.cmd,*.vbs,*.ps1,*.js,*.jar -ErrorAction SilentlyContinue |
-                Select-Object FullName,Length,LastWriteTime)
+            if (-not (Test-Path $d)) { continue }
+            foreach ($f in @(Get-ChildItem $d -Recurse -Include *.exe,*.bat,*.cmd,*.vbs,*.ps1,*.js,*.jar -ErrorAction SilentlyContinue)) {
+                $found.Add([pscustomobject]@{ FullName=$f.FullName; Length=$f.Length; LastWriteTime=$f.LastWriteTime })
+            }
         }
         $found | Export-Csv (Join-Path $ev '36-sketchy-binaries.csv') -NoTypeInformation
         if ($found.Count -gt 0) {
@@ -945,15 +1131,20 @@ function Invoke-Recon {
         }
     }
 
-    # ---- shares ----------------------------------------------------------
+    # ---- shares (including hidden/custom $ shares!) ----------------------
     Invoke-CP 'shares and share ACLs' {
         $sh = @()
         try { $sh = @(Get-SmbShare -ErrorAction Stop) } catch {}
         $sh | Export-Csv (Join-Path $ev '40-shares.csv') -NoTypeInformation
-        $aclAll = @()
+        $aclAll = New-Object System.Collections.Generic.List[object]
         foreach ($s in $sh) {
+            if ($s.Name -notmatch '^(?i)(ADMIN\$|IPC\$|print\$|SYSVOL|NETLOGON|[A-Z]\$)$') {
+                Add-Finding -Id "SHARE-CUSTOM-$($s.Name)" -Area 'Shares' -Status 'FAIL' `
+                    -Detail "non-default/hidden share '$($s.Name)' -> '$($s.Path)'" `
+                    -Hint 'Hidden or custom shares (like USERS$) are scored unless required by README. Remove-SmbShare -Name <name> -Force (handled in network section).'
+            }
             $acl = @(Get-SmbShareAccess -Name $s.Name -ErrorAction SilentlyContinue)
-            foreach ($a in $acl) { $aclAll += $a }
+            foreach ($a in $acl) { $aclAll.Add($a) }
             foreach ($a in $acl) {
                 if ($a.AccountName -match '(?i)everyone|authenticated users|^guest|anonymous' -and $a.AccessRight -match 'Full|Change') {
                     Add-Finding -Id "SHARE-$($s.Name)" -Area 'Shares' -Status 'FAIL' `
@@ -961,13 +1152,13 @@ function Invoke-Recon {
                         -Hint 'Everyone=Full on a share is a very common scored vuln. Revoke-SmbShareAccess / Grant-SmbShareAccess.'
                 }
             }
-            if ($s.Name -notmatch '\$$') {
+            if ($s.Name -notmatch '^(?i)(ADMIN\$|IPC\$|print\$|[A-Z]\$)$') {
                 try {
-                    $ntfs = @(Get-Acl ("\\localhost\" + $s.Name) -ErrorAction Stop).Access
+                    $ntfs = @(Get-Acl -LiteralPath $s.Path -ErrorAction Stop).Access
                     foreach ($n in $ntfs) {
                         if ("$($n.IdentityReference)" -match '(?i)everyone|^guest|anonymous' -and "$($n.FileSystemRights)" -match 'FullControl|Modify|Write') {
                             Add-Finding -Id "NTFS-$($s.Name)" -Area 'Shares' -Status 'WARN' `
-                                -Detail "$($s.Name) NTFS: $($n.IdentityReference) = $($n.FileSystemRights)" `
+                                -Detail "$($s.Name) NTFS ($($s.Path)): $($n.IdentityReference) = $($n.FileSystemRights)" `
                                 -Hint 'NTFS perms are scored separately from share perms. Fix BOTH layers.'
                         }
                     }
@@ -977,34 +1168,43 @@ function Invoke-Recon {
         $aclAll | Export-Csv (Join-Path $ev '40-share-acl.csv') -NoTypeInformation
     }
 
-    # ---- recent files + PII ----------------------------------------------
+    # ---- recent files + PII (targeted to avoid AppData cache bloat) ------
     Invoke-CP 'recently modified files' {
         $since = (Get-Date).AddDays(-180)
         $exts = '\.(txt|doc|docx|xls|xlsx|pdf|png|jpg|jpeg|gif|bmp|zip|rar|7z|tar|gz|exe|dll|bat|ps1|vbs|js|db|sqlite|sql|kdbx|log|csv|xml|ini|conf|bak)$'
-        $paths = @()
+        $paths = New-Object System.Collections.Generic.List[string]
         foreach ($p in (Get-ChildItem C:\Users -Directory -ErrorAction SilentlyContinue)) {
             if ($p.Name -in @('Default','Default User','All Users')) { continue }
-            $paths += $p.FullName
+            foreach ($sub in @('Desktop','Downloads','Documents','Pictures','Music','Videos')) {
+                $sp = Join-Path $p.FullName $sub
+                if (Test-Path $sp) { $paths.Add($sp) }
+            }
         }
-        $paths += 'C:\ProgramData','C:\inetpub','C:\Temp','C:\Windows\Temp'
-        $rows = @()
+        foreach ($extra in @('C:\Users\Public','C:\ProgramData','C:\inetpub','C:\Temp','C:\Windows\Temp','C:\Downloads')) {
+            if (Test-Path $extra) { $paths.Add($extra) }
+        }
+        $rows = New-Object System.Collections.Generic.List[object]
         foreach ($pp in $paths) {
-            if (-not (Test-Path $pp)) { continue }
-            $rows += @(Get-ChildItem $pp -Recurse -File -ErrorAction SilentlyContinue |
-                Where-Object { $_.LastWriteTime -gt $since -and $_.Extension -match $exts } |
-                Select-Object FullName,Length,LastWriteTime,CreationTime,Extension)
+            foreach ($f in @(Get-ChildItem $pp -Recurse -File -ErrorAction SilentlyContinue)) {
+                if ($f.LastWriteTime -gt $since -and $f.Extension -match $exts) {
+                    $rows.Add([pscustomobject]@{
+                        FullName=$f.FullName; Length=$f.Length; LastWriteTime=$f.LastWriteTime
+                        CreationTime=$f.CreationTime; Extension=$f.Extension
+                    })
+                }
+            }
         }
         $rows | Sort-Object LastWriteTime -Descending | Export-Csv (Join-Path $ev '50-recent-files.csv') -NoTypeInformation
         Write-CP "$($rows.Count) recently-modified candidate files catalogued" 'ok'
 
-        $piiHits = @()
+        $piiHits = New-Object System.Collections.Generic.List[object]
         foreach ($f in ($rows | Where-Object { $_.Extension -in '.txt','.csv','.log','.xml','.ini','.conf' } | Select-Object -First 500)) {
             try {
                 $c = Get-Content $f.FullName -Raw -ErrorAction Stop
                 if (-not $c) { continue }
-                if ($c -match '\b\d{3}-\d{2}-\d{4}\b') { $piiHits += [pscustomobject]@{ File=$f.FullName; Type='SSN-pattern' } }
-                if ($c -match '(?i)(password|passwd|pwd|secret|api[_-]?key|token)\s*[:=]\s*\S{3,}') { $piiHits += [pscustomobject]@{ File=$f.FullName; Type='cleartext-credential' } }
-                if ($c -match '(?i)(card|visa|mastercard|amex|credit)' -and $c -match '\b(?:\d[ -]?){13,19}\b') { $piiHits += [pscustomobject]@{ File=$f.FullName; Type='card-pattern' } }
+                if ($c -match '\b\d{3}-\d{2}-\d{4}\b') { $piiHits.Add([pscustomobject]@{ File=$f.FullName; Type='SSN-pattern' }) }
+                if ($c -match '(?i)(password|passwd|pwd|secret|api[_-]?key|token)\s*[:=]\s*\S{3,}') { $piiHits.Add([pscustomobject]@{ File=$f.FullName; Type='cleartext-credential' }) }
+                if ($c -match '(?i)(card|visa|mastercard|amex|credit)' -and $c -match '\b(?:\d[ -]?){13,19}\b') { $piiHits.Add([pscustomobject]@{ File=$f.FullName; Type='card-pattern' }) }
             } catch {}
         }
         $piiHits | Export-Csv (Join-Path $ev '51-pii-candidates.csv') -NoTypeInformation
@@ -1017,7 +1217,7 @@ function Invoke-Recon {
     }
 
     # ---- forensic artifacts ----------------------------------------------
-    Invoke-CP 'forensic artifacts (prefetch/recent/USB/MOTW)' {
+    Invoke-CP 'forensic artifacts (prefetch/recent/USB/MOTW/PSHistory)' {
         $pfDir = Join-Path $ev 'prefetch'
         New-Item -ItemType Directory -Path $pfDir -Force -ErrorAction SilentlyContinue | Out-Null
         Copy-Item 'C:\Windows\Prefetch\*.pf' $pfDir -Force -ErrorAction SilentlyContinue
@@ -1028,6 +1228,8 @@ function Invoke-Recon {
         }
 
         Remove-Item (Join-Path $ev '61-recent.csv'),(Join-Path $ev '66-jumplists.csv') -Force -ErrorAction SilentlyContinue
+        $psHistOut = Join-Path $ev '67-ps-history.txt'
+        if (Test-Path $psHistOut) { Remove-Item $psHistOut -Force -ErrorAction SilentlyContinue }
         foreach ($u in (Get-ChildItem C:\Users -Directory -ErrorAction SilentlyContinue)) {
             $rp = Join-Path $u.FullName 'AppData\Roaming\Microsoft\Windows\Recent'
             if (Test-Path $rp) {
@@ -1040,6 +1242,12 @@ function Invoke-Recon {
                 Get-ChildItem $jl -File -ErrorAction SilentlyContinue |
                     Select-Object @{n='User';e={$u.Name}},Name,Length,LastWriteTime |
                     Export-Csv -Append (Join-Path $ev '66-jumplists.csv') -NoTypeInformation -ErrorAction SilentlyContinue
+            }
+            $psh = Join-Path $u.FullName 'AppData\Roaming\Microsoft\Windows\PowerShell\PSReadLine\ConsoleHost_history.txt'
+            if (Test-Path $psh) {
+                Add-Content $psHistOut ("===== " + $psh)
+                Get-Content $psh -ErrorAction SilentlyContinue | Add-Content $psHistOut
+                Add-Content $psHistOut ''
             }
         }
 
@@ -1066,15 +1274,24 @@ function Invoke-Recon {
             Select-Object FullName,Length,LastWriteTime |
             Export-Csv (Join-Path $ev '64-recyclebin.csv') -NoTypeInformation
 
-        # mark of the web: "this file came from the internet, here is the URL"
-        $zoi = @()
-        $scanRoots = @('C:\Users','C:\Temp','C:\Downloads','C:\ProgramData')
+        # mark of the web: targeted to user docs/downloads (avoids AppData cache bloat)
+        $zoi = New-Object System.Collections.Generic.List[object]
+        $scanRoots = New-Object System.Collections.Generic.List[string]
+        foreach ($u in (Get-ChildItem C:\Users -Directory -ErrorAction SilentlyContinue)) {
+            if ($u.Name -in @('Default','Default User','All Users')) { continue }
+            foreach ($sub in @('Desktop','Downloads','Documents')) {
+                $sp = Join-Path $u.FullName $sub
+                if (Test-Path $sp) { $scanRoots.Add($sp) }
+            }
+        }
+        foreach ($sr in @('C:\Users\Public','C:\Temp','C:\Downloads')) {
+            if (Test-Path $sr) { $scanRoots.Add($sr) }
+        }
         foreach ($sr in $scanRoots) {
-            if (-not (Test-Path $sr)) { continue }
-            foreach ($f in @(Get-ChildItem $sr -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 1500)) {
+            foreach ($f in @(Get-ChildItem $sr -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 800)) {
                 try {
                     $s = Get-Item $f.FullName -Stream Zone.Identifier -ErrorAction Stop
-                    if ($s) { $zoi += [pscustomobject]@{ File=$f.FullName; Size=$s.Length; LastWrite=$f.LastWriteTime } }
+                    if ($s) { $zoi.Add([pscustomobject]@{ File=$f.FullName; Size=$s.Length; LastWrite=$f.LastWriteTime }) }
                 } catch {}
             }
         }
@@ -1085,22 +1302,56 @@ function Invoke-Recon {
         }
     }
 
-    # ---- programs / hosts / update / defender state ------------------------
-    Invoke-CP 'installed programs' {
+    # ---- programs / appx / outdated apps / hosts / update / defender -----
+    Invoke-CP 'installed programs + store apps + outdated check' {
         $paths = @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
                    'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*',
                    'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*')
         $p = @(Get-ItemProperty $paths -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName })
         $p | Select-Object DisplayName,DisplayVersion,Publisher,InstallDate,InstallLocation,UninstallString |
             Sort-Object DisplayName | Export-Csv (Join-Path $ev '70-programs.csv') -NoTypeInformation
-        $suspect = '(?i)teamviewer|ammyy|anydesk|logmein|vnc|tightvnc|realvnc|ngrok|nmap|wireshark|mimikatz|netcat|ncat|putty|filezilla|torrent|utorrent|bittorrent|xmrig|minergate|keylog|procexp|procmon|process hacker|nirsoft|pwdump|quarks|psexec|hydra|john the ripper|hashcat|ophcrack|cain|angry ip|advanced ip|metasploit|burp|nessus|emule|skype|discord|steam'
+        $suspect = '(?i)teamviewer|ammyy|anydesk|logmein|vnc|tightvnc|realvnc|ultravnc|tigervnc|radmin|rustdesk|parsec|ngrok|hamachi|zerotier|nmap|zenmap|wireshark|fiddler|charles|winpcap|npcap|mimikatz|rubeus|sharphound|bloodhound|netcat|ncat|putty|filezilla|winscp|cyberduck|tftp|torrent|utorrent|bittorrent|qbittorrent|deluge|transmission|frostwire|vuze|xmrig|minergate|keylog|procexp|procmon|process hacker|nirsoft|pwdump|fgdump|quarks|psexec|hydra|john|hashcat|ophcrack|cain|abel|angry ip|angryip|advanced ip|advanced port|metasploit|burp|nessus|aircrack|sqlmap|nikto|gobuster|dirb|ettercap|bettercap|ghidra|x64dbg|ollydbg|cheat engine|autohotkey|wildtangent|windirstat|ccleaner|bonjour|tor browser|openvpn|emule|skype|discord|steam|epic games|battle\.net|riot|roblox|minecraft|origin|ea app|uplay|gog galaxy'
         foreach ($x in $p) {
             if ($x.DisplayName -match $suspect) {
                 Add-Finding -Id "PROG-$($x.DisplayName)" -Area 'Software' -Status 'WARN' `
                     -Detail "installed: $($x.DisplayName) $($x.DisplayVersion)" `
-                    -Hint 'Remote-access tooling, p2p, media, or attack tools. Check the README approved list, uninstall through Settings > Apps, record it.'
+                    -Hint 'Remote-access, p2p, games, bloatware, or attack/recon tools (e.g. WildTangent/WinDirStat/Wireshark). Check README, uninstall, and document.'
             }
         }
+
+        # key commonly-scored third-party apps (version inventory + winget upgrade check)
+        $watchRx = '(?i)notepad\+\+|firefox|chrome|edge|7-zip|vlc|python|openssh|putty|filezilla|winrar|adobe|gimp|libreoffice|thunderbird'
+        $watch = @($p | Where-Object { $_.DisplayName -match $watchRx } | Select-Object DisplayName,DisplayVersion,Publisher)
+        $outLines = New-Object System.Collections.Generic.List[string]
+        $outLines.Add('=== Watched Third-Party App Versions ===')
+        foreach ($w in $watch) { $outLines.Add(("{0,-45} {1}" -f $w.DisplayName, $w.DisplayVersion)) }
+        if (Get-Command winget.exe -ErrorAction SilentlyContinue) {
+            try {
+                $outLines.Add('')
+                $outLines.Add('=== winget upgrade ===')
+                $wg = & winget.exe upgrade --accept-source-agreements 2>&1
+                foreach ($wl in $wg) { $outLines.Add("$wl") }
+            } catch {}
+        }
+        $outLines | Set-Content (Join-Path $ev '72-outdated-apps.txt')
+        if ($watch.Count -gt 0) {
+            Add-Finding -Id 'PROG-WATCH' -Area 'Software' -Status 'INFO' `
+                -Detail "$($watch.Count) tracked app(s) inventoried in 72-outdated-apps.txt (Notepad++, browsers, 7-Zip, etc.)" `
+                -Hint 'Outdated 3rd-party apps (Notepad++, Firefox, Chrome, 7-Zip) are frequently scored. Use -Phase software or update manually.'
+        }
+
+        # Microsoft Store / Appx packages
+        try {
+            $appx = @(Get-AppxPackage -AllUsers -ErrorAction Stop | Select-Object Name,Version,Publisher,PackageFullName)
+            $appx | Export-Csv (Join-Path $ev '71-appx-packages.csv') -NoTypeInformation
+            foreach ($ax in $appx) {
+                if ($ax.Name -match '(?i)candycrush|solitaire|xboxgaming|wildtangent|minecraft|roblox|disney|tiktok|spotify|torrent') {
+                    Add-Finding -Id "APPX-$($ax.Name)" -Area 'Software' -Status 'INFO' `
+                        -Detail "Store app installed: $($ax.Name) ($($ax.Version))" `
+                        -Hint 'Check if games/bloatware should be removed via Remove-AppxPackage.'
+                }
+            }
+        } catch {}
     }
 
     Invoke-CP 'hosts file' {
@@ -1132,7 +1383,7 @@ function Invoke-Recon {
         }
     }
 
-    Invoke-CP 'event log checks' {
+    Invoke-CP 'event log + forensic security events' {
         Get-WinEvent -ListLog Security,System,Application -ErrorAction SilentlyContinue |
             Select-Object LogName,IsEnabled,MaximumSizeInBytes,RecordCount |
             Export-Csv (Join-Path $ev '80-eventlogs.csv') -NoTypeInformation
@@ -1152,6 +1403,13 @@ function Invoke-Recon {
                     -Detail "Security log was cleared $($cleared.Count) time(s), most recent $($cleared[0].TimeCreated)" `
                     -Hint 'Event 1102 = "audit log was cleared". That is a scored finding AND a forensic answer. Record who and when.'
             }
+        } catch {}
+
+        # extract key forensic security events (4720, 4726, 4728, 4732, 4625)
+        try {
+            $secEvs = @(Get-WinEvent -FilterHashtable @{LogName='Security'; Id=@(4720,4726,4728,4732,4625)} -MaxEvents 100 -ErrorAction Stop)
+            $secEvs | Select-Object TimeCreated,Id,@{n='Summary';e={($_.Message -split "`r?`n")[0]}} |
+                Format-Table -Auto | Out-String -Width 240 | Set-Content (Join-Path $ev '82-security-events-summary.txt')
         } catch {}
     }
 
@@ -1175,19 +1433,22 @@ function Invoke-Users {
             -Hint 'Password/lockout policy on a DC comes from the Default Domain Policy GPO (gpmc.msc), not secedit. Also check for a Fine-Grained Password Policy.'
     }
 
-    # ---- 1. reconcile accounts against the README lists -------------------
+    # ---- 1. reconcile accounts & groups against the README lists ----------
     $usersPath  = Join-Path $PSScriptRoot 'users.txt'
     $adminsPath = Join-Path $PSScriptRoot 'admins.txt'
+    $groupsPath = Join-Path $PSScriptRoot 'groups.txt'
     $made = $false
     if (-not (Test-Path $usersPath))  { if (-not $script:Dry) { Set-Content $usersPath  '# standard (non-admin) users from the README, one per line'; $made = $true } }
     if (-not (Test-Path $adminsPath)) { if (-not $script:Dry) { Set-Content $adminsPath '# administrators from the README, one per line';            $made = $true } }
+    if (-not (Test-Path $groupsPath)) { if (-not $script:Dry) { Set-Content $groupsPath '# custom groups from the README, format: GroupName:user1,user2'; $made = $true } }
     if ($made) {
-        Write-CP 'created users.txt / admins.txt templates next to the script.' 'warn'
+        Write-CP 'created users.txt / admins.txt / groups.txt templates next to the script.' 'warn'
         Write-CP 'fill them in from the README, then run the users section again.' 'warn'
     }
 
     $admins = @(Read-List $adminsPath '# administrators from the README, one per line')
     $users  = @(Read-List $usersPath  '# standard (non-admin) users from the README, one per line')
+    $groupsCfg = @(Read-List $groupsPath '# custom groups from the README, format: GroupName:user1,user2')
     $all = @($users + $admins)
     $me = $env:USERNAME
 
@@ -1201,7 +1462,7 @@ function Invoke-Users {
                 Add-Review "you are logged in as '$me' but it is not on the lists -- re-read the README"
                 continue
             }
-            if ($Paranoid -or $script:Dry) { Add-Review "unlisted account '$($u.Name)' (dry-run/paranoid: no action)"; continue }
+            if ($script:Para -or $script:Dry) { Add-Review "unlisted account '$($u.Name)' (dry-run/paranoid: no action)"; continue }
             Write-Host ''
             $c = Read-Host '  (R)emove, (D)isable, or (S)kip [S]'
             $n = $u.Name
@@ -1237,7 +1498,7 @@ function Invoke-Users {
                 Add-Review "'$me' is an admin but is not in admins.txt -- check the README"
                 continue
             }
-            if ($Paranoid -or $script:Dry) { Add-Review "admin '$n' is not in admins.txt (no action)"; continue }
+            if ($script:Para -or $script:Dry) { Add-Review "admin '$n' is not in admins.txt (no action)"; continue }
             Write-Host ''
             $c = Read-Host "  '$n' is an Administrator but not in admins.txt. Demote? (y/N)"
             if ($c -match '^[Yy]') {
@@ -1251,7 +1512,7 @@ function Invoke-Users {
         }
         foreach ($n in $admins) {
             if ($current -notcontains $n -and (Get-CPUsers | Where-Object { $_.Name -eq $n })) {
-                if ($Paranoid -or $script:Dry) { Add-Review "'$n' should be an admin per admins.txt (no action)"; continue }
+                if ($script:Para -or $script:Dry) { Add-Review "'$n' should be an admin per admins.txt (no action)"; continue }
                 Write-Host ''
                 $c = Read-Host "  '$n' should be an admin per admins.txt. Add to Administrators? (y/N)"
                 if ($c -match '^[Yy]') {
@@ -1263,7 +1524,7 @@ function Invoke-Users {
         }
 
         # one strong password on every authorized account (optional)
-        if (-not ($Paranoid -or $script:Dry)) {
+        if (-not ($script:Para -or $script:Dry)) {
             Write-Host ''
             $c = Read-Host '  set ONE new strong password on every authorized account? (y/N)'
             if ($c -match '^[Yy]') {
@@ -1318,6 +1579,43 @@ function Invoke-Users {
         Add-Review 'users.txt/admins.txt empty: fill them from the README and re-run the users section'
     }
 
+    # ---- 1b. custom groups from groups.txt + interactive group helper -----
+    foreach ($gs in $groupsCfg) {
+        $parts = $gs -split ':', 2
+        $gName = $parts[0].Trim()
+        if (-not $gName) { continue }
+        $gMembers = @()
+        if ($parts.Count -gt 1 -and $parts[1]) {
+            $gMembers = @($parts[1] -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+        }
+        if (-not (Get-LocalGroup -Name $gName -ErrorAction SilentlyContinue)) {
+            Invoke-CP "create local group '$gName'" { New-LocalGroup -Name $gName -ErrorAction Stop | Out-Null } | Out-Null
+        }
+        foreach ($gm in $gMembers) {
+            $existing = @()
+            try { $existing = @(Get-LocalGroupMember -Group $gName -ErrorAction Stop | ForEach-Object { ($_.Name -split '\\')[-1] }) } catch {}
+            if ($existing -notcontains $gm) {
+                Invoke-CP "add '$gm' to group '$gName'" { Add-LocalGroupMember -Group $gName -Member $gm -ErrorAction Stop } | Out-Null
+            }
+        }
+    }
+    if (-not ($script:Para -or $script:Dry -or $Force)) {
+        Write-Host ''
+        $cgAns = Read-Host '  create a custom local group or add members interactively? (y/N)'
+        if ($cgAns -match '^[Yy]') {
+            $cgName = (Read-Host '  group name (blank to skip)').Trim()
+            if ($cgName) {
+                if (-not (Get-LocalGroup -Name $cgName -ErrorAction SilentlyContinue)) {
+                    Invoke-CP "create group '$cgName'" { New-LocalGroup -Name $cgName -ErrorAction Stop | Out-Null } | Out-Null
+                }
+                $cgMembers = Read-Host "  comma-separated users to add to '$cgName' (blank for none)"
+                foreach ($gm in ($cgMembers -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })) {
+                    Invoke-CP "add '$gm' to '$cgName'" { Add-LocalGroupMember -Group $cgName -Member $gm -ErrorAction Stop } | Out-Null
+                }
+            }
+        }
+    }
+
     $acctNames = (@(Get-CPUsers) | ForEach-Object { $_.Name }) -join ', '
     Add-Finding -Id 'ACC-INVENTORY' -Area 'Accounts' -Status 'INFO' `
         -Detail ("local accounts: {0}" -f $acctNames) `
@@ -1326,7 +1624,7 @@ function Invoke-Users {
     # ---- 2. secedit policy MERGE ------------------------------------------
     if (-not $isDC) {
         Write-CP 'merging local security policy (secedit)' 'step'
-        Invoke-CP 'secedit policy merge (password/lockout/audit/registry values)' {
+        Invoke-CP 'secedit policy merge (password/lockout/audit/registry values/user rights)' {
             $inf = Get-SeceditInf
             New-Item -ItemType Directory -Path $script:BkDir -Force -ErrorAction SilentlyContinue | Out-Null
             Copy-Item $inf (Join-Path $script:BkDir 'secpol-exported.inf') -Force -ErrorAction SilentlyContinue
@@ -1370,13 +1668,20 @@ function Invoke-Users {
                 'MACHINE\System\CurrentControlSet\Control\Lsa\LMCompatibilityLevel'                   = '4,5'
                 'MACHINE\System\CurrentControlSet\Control\Lsa\EveryoneIncludesAnonymous'            = '4,0'
                 'MACHINE\System\CurrentControlSet\Control\Lsa\ForceGuest'                           = '4,0'
+                'MACHINE\System\CurrentControlSet\Control\Lsa\DisableDomainCreds'                   = '4,1'
+                'MACHINE\System\CurrentControlSet\Control\Lsa\SCENoApplyLegacyAuditPolicy'          = '4,1'
                 'MACHINE\System\CurrentControlSet\Services\LDAP\LDAPClientIntegrity'                 = '4,1'
                 'MACHINE\System\CurrentControlSet\Services\Netlogon\Parameters\RequireSignOrSeal'    = '4,1'
                 'MACHINE\System\CurrentControlSet\Services\Netlogon\Parameters\SealSecureChannel'     = '4,1'
                 'MACHINE\System\CurrentControlSet\Services\Netlogon\Parameters\SignSecureChannel'    = '4,1'
+                'MACHINE\System\CurrentControlSet\Services\Netlogon\Parameters\RequireStrongKey'     = '4,1'
+                'MACHINE\System\CurrentControlSet\Services\Netlogon\Parameters\DisablePasswordChange'= '4,0'
+                'MACHINE\System\CurrentControlSet\Services\Netlogon\Parameters\MaximumPasswordAge'   = '4,30'
                 'MACHINE\System\CurrentControlSet\Services\LanmanServer\Parameters\RequireSecuritySignature' = '4,1'
                 'MACHINE\System\CurrentControlSet\Services\LanmanServer\Parameters\EnableSecuritySignature'  = '4,1'
+                'MACHINE\System\CurrentControlSet\Services\LanmanServer\Parameters\RestrictNullSessAccess'   = '4,1'
                 'MACHINE\System\CurrentControlSet\Services\LanmanWorkstation\Parameters\RequireSecuritySignature' = '4,1'
+                'MACHINE\System\CurrentControlSet\Services\LanmanWorkstation\Parameters\EnablePlainTextPassword'  = '4,0'
                 'MACHINE\Software\Microsoft\Windows NT\CurrentVersion\Winlogon\AllocateCDRoms'      = '1,1'
                 'MACHINE\Software\Microsoft\Windows NT\CurrentVersion\Winlogon\AllocateFloppies'     = '1,1'
                 'MACHINE\Software\Microsoft\Windows NT\CurrentVersion\Winlogon\CachedLogonsCount'    = '1,2'
@@ -1388,14 +1693,13 @@ function Invoke-Users {
                 'MACHINE\Software\Microsoft\Windows\CurrentVersion\Policies\System\EnableLUA'      = '4,1'
                 'MACHINE\Software\Microsoft\Windows\CurrentVersion\Policies\System\PromptOnSecureDesktop'      = '4,1'
                 'MACHINE\Software\Microsoft\Windows\CurrentVersion\Policies\System\ShutdownWithoutLogon'       = '4,0'
+                'MACHINE\Software\Microsoft\Windows\CurrentVersion\Policies\System\UndockWithoutLogon'         = '4,0'
                 'MACHINE\Software\Microsoft\Windows\CurrentVersion\Policies\Explorer\NoDriveTypeAutoRun'        = '4,255'
                 'MACHINE\Software\Microsoft\Windows\CurrentVersion\Policies\Attachments\SaveZoneInformation'  = '4,1'
             }
             foreach ($k in $rv.Keys) { $null = Set-SeceditValue -Lines $lines -Section 'Registry Values' -Key $k -Value $rv[$k] }
 
-            # [Privilege Rights] -- only the safe deny entries. clobbering the
-            # rest locks you out; the full assignment is a secpol.msc by-hand
-            # job against the README. S-1-5-32-546 = Guests.
+            # [Privilege Rights] -- safe guest denials + remediate non-admin abuse on sensitive privileges
             $pr = [ordered]@{
                 'SeDenyNetworkLogonRight'           = '*S-1-5-32-546'
                 'SeDenyInteractiveLogonRight'       = '*S-1-5-32-546'
@@ -1405,13 +1709,50 @@ function Invoke-Users {
             }
             foreach ($k in $pr.Keys) { $null = Set-SeceditValue -Lines $lines -Section 'Privilege Rights' -Key $k -Value $pr[$k] }
 
+            $curRights = Get-CPUserRights -InfPath $inf
+            $adminNames2 = @(Get-AdminMemberNames)
+            $adminOnlyRights = @(
+                'SeSecurityPrivilege','SeTakeOwnershipPrivilege','SeDebugPrivilege',
+                'SeBackupPrivilege','SeRestorePrivilege','SeLoadDriverPrivilege',
+                'SeManageVolumePrivilege','SeRemoteShutdownPrivilege','SeRelabelPrivilege'
+            )
+            $noOneRights = @(
+                'SeTcbPrivilege','SeCreateTokenPrivilege','SeTrustedCredManAccessPrivilege',
+                'SeEnableDelegationPrivilege','SeCreatePermanentPrivilege','SeLockMemoryPrivilege',
+                'SeSyncAgentPrivilege'
+            )
+            foreach ($ur in $curRights) {
+                $targetDefault = $null
+                if ($ur.Right -in $adminOnlyRights) { $targetDefault = '*S-1-5-32-544' }
+                elseif ($ur.Right -in $noOneRights) { $targetDefault = '' }
+                else { continue }
+
+                $badNames = @()
+                foreach ($nm in $ur.Names) {
+                    $short = ($nm -split '\\')[-1]
+                    if ($short -match '^(Administrators|SYSTEM)$') { continue }
+                    if ($short -match '^(Everyone|Anonymous Logon|ANONYMOUS LOGON|Guest|Guests|Users|Authenticated Users)$' -or ($adminNames2 -notcontains $short)) {
+                        $badNames += $nm
+                    }
+                }
+                if ($badNames.Count -gt 0) {
+                    $desc = if ($targetDefault) { 'Administrators only' } else { 'No One' }
+                    Write-CP ("User Right {0} currently has unauthorized account(s): {1}" -f $ur.Right, ($badNames -join ', ')) 'warn'
+                    if ($Force -or (Confirm-CP ("Reset User Right '{0}' to {1}?" -f $ur.Right, $desc))) {
+                        $null = Set-SeceditValue -Lines $lines -Section 'Privilege Rights' -Key $ur.Right -Value $targetDefault
+                        Register-Change -What "UserRight:$($ur.Right)" -Old ($ur.Names -join ',') -New $desc
+                        Add-Finding -Id "URIGHT-FIX-$($ur.Right)" -Area 'Policy' -Status 'PASS' -Detail "$($ur.Right) reset to $desc"
+                    }
+                }
+            }
+
             $out = Join-Path $script:BkDir 'secpol-hardened.inf'
             New-Item -ItemType Directory -Path $script:BkDir -Force -ErrorAction SilentlyContinue | Out-Null
             Set-Content -Path $out -Value $lines -Encoding Unicode
             if (-not (Apply-SeceditInf -InfPath $out)) { throw 'secedit /configure failed' }
             Remove-Item $inf -Force -ErrorAction SilentlyContinue
         }
-        if (-not ($Paranoid -or $script:Dry)) { Invoke-CP 'gpupdate /force' { & gpupdate /force 2>&1 | Out-Null } | Out-Null }
+        if (-not ($script:Para -or $script:Dry)) { Invoke-CP 'gpupdate /force' { & gpupdate /force 2>&1 | Out-Null } | Out-Null }
 
         # screen saver lock -- very commonly scored, easy to miss
         Invoke-CP 'screen saver lock (10 min, password protected)' {
@@ -1447,19 +1788,22 @@ function Invoke-Users {
 # ------------------------------------------------------------------------------
 function Invoke-Registry {
     Write-Banner 'REGISTRY HARDENING'
-    if ($Paranoid) { Write-CP 'paranoid mode: registry pass skipped' 'warn'; return }
+    if ($script:Para) { Write-CP 'paranoid mode: registry pass skipped' 'warn'; return }
 
     $lsa = 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa'
-    Set-CPReg -Path $lsa -Name 'RestrictAnonymous'          -Value 1 -Id 'REG-RestrictAnonymous' -Area 'Registry' | Out-Null
-    Set-CPReg -Path $lsa -Name 'RestrictAnonymousSAM'       -Value 1 -Id 'REG-RestrictAnonSAM'   -Area 'Registry' | Out-Null
-    Set-CPReg -Path $lsa -Name 'NoLMHash'                   -Value 1 -Id 'REG-NoLMHash'          -Area 'Registry' | Out-Null
-    Set-CPReg -Path $lsa -Name 'LMCompatibilityLevel'       -Value 5 -Id 'REG-LMCompat'          -Area 'Registry' | Out-Null
-    Set-CPReg -Path $lsa -Name 'LimitBlankPasswordUse'      -Value 1 -Id 'REG-BlankPwUse'        -Area 'Registry' | Out-Null
-    Set-CPReg -Path $lsa -Name 'EveryoneIncludesAnonymous'  -Value 0 -Id 'REG-EveryoneAnon'      -Area 'Registry' | Out-Null
-    Set-CPReg -Path $lsa -Name 'ForceGuest'                -Value 0 -Id 'REG-ForceGuest'        -Area 'Registry' | Out-Null
-    Set-CPReg -Path $lsa -Name 'DisableDomainCreds'         -Value 0 | Out-Null
-    # WDigest keeps cleartext passwords in LSASS -- the mimikatz special
+    Set-CPReg -Path $lsa -Name 'RestrictAnonymous'           -Value 1 -Id 'REG-RestrictAnonymous' -Area 'Registry' | Out-Null
+    Set-CPReg -Path $lsa -Name 'RestrictAnonymousSAM'        -Value 1 -Id 'REG-RestrictAnonSAM'   -Area 'Registry' | Out-Null
+    Set-CPReg -Path $lsa -Name 'NoLMHash'                    -Value 1 -Id 'REG-NoLMHash'          -Area 'Registry' | Out-Null
+    Set-CPReg -Path $lsa -Name 'LMCompatibilityLevel'        -Value 5 -Id 'REG-LMCompat'          -Area 'Registry' | Out-Null
+    Set-CPReg -Path $lsa -Name 'LimitBlankPasswordUse'       -Value 1 -Id 'REG-BlankPwUse'        -Area 'Registry' | Out-Null
+    Set-CPReg -Path $lsa -Name 'EveryoneIncludesAnonymous'   -Value 0 -Id 'REG-EveryoneAnon'      -Area 'Registry' | Out-Null
+    Set-CPReg -Path $lsa -Name 'ForceGuest'                  -Value 0 -Id 'REG-ForceGuest'        -Area 'Registry' | Out-Null
+    Set-CPReg -Path $lsa -Name 'DisableDomainCreds'          -Value 1 -Id 'REG-DisableDomainCreds' -Area 'Registry' | Out-Null
+    Set-CPReg -Path $lsa -Name 'SCENoApplyLegacyAuditPolicy' -Value 1 -Id 'REG-NoLegacyAudit'     -Area 'Audit' | Out-Null
+    Set-CPReg -Path $lsa -Name 'UseMachineId'                -Value 1 | Out-Null
+    # WDigest keeps cleartext passwords in LSASS -- both legacy and real SecurityProviders path
     Set-CPReg -Path "$lsa\WDigest" -Name 'UseLogonCredential' -Value 0 -Id 'REG-WDigest' -Area 'Registry' | Out-Null
+    Set-CPReg -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\WDigest' -Name 'UseLogonCredential' -Value 0 -Id 'REG-WDigest-Real' -Area 'Registry' | Out-Null
     # LSA protection (run as PPL). needs a reboot, worth the point.
     $ppl = Get-CPReg -Path $lsa -Name 'RunAsPPL'
     if ($null -eq $ppl -or $ppl -lt 1) {
@@ -1473,24 +1817,28 @@ function Invoke-Registry {
     Set-CPReg -Path "$lsa\pku2u"  -Name 'AllowOnlineID'             -Value 0 | Out-Null
 
     $sm = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager'
-    Set-CPReg -Path "$sm\Kernel"            -Name 'ObCaseInsensitive'      -Value 1 | Out-Null
+    Set-CPReg -Path "$sm\Kernel"            -Name 'ObCaseInsensitive'       -Value 1 | Out-Null
     Set-CPReg -Path "$sm\Memory Management" -Name 'ClearPageFileAtShutdown' -Value 1 -Id 'REG-ClearPagefile' -Area 'Registry' | Out-Null
-    Set-CPReg -Path $sm                      -Name 'ProtectionMode'          -Value 1 | Out-Null
+    Set-CPReg -Path $sm                     -Name 'ProtectionMode'          -Value 1 | Out-Null
+    Set-CPReg -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\CrashControl' -Name 'CrashDumpEnabled' -Value 0 | Out-Null
+    Set-CPReg -Path 'HKLM:\SOFTWARE\Microsoft\DirectPlayNATHelp\DPNHUPnP'  -Name 'UPnPMode' -Value 2 | Out-Null
 
-    # ---- UAC --------------------------------------------------------------
+    # ---- UAC & logon -------------------------------------------------------
     $pol = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System'
     Set-CPReg -Path $pol -Name 'EnableLUA'                  -Value 1 -Id 'REG-UAC-EnableLUA'     -Area 'UAC' | Out-Null
     Set-CPReg -Path $pol -Name 'ConsentPromptBehaviorAdmin' -Value 2 -Id 'REG-UAC-ConsentAdmin'  -Area 'UAC' | Out-Null
     Set-CPReg -Path $pol -Name 'ConsentPromptBehaviorUser'  -Value 0 -Id 'REG-UAC-ConsentUser'   -Area 'UAC' | Out-Null
     Set-CPReg -Path $pol -Name 'PromptOnSecureDesktop'      -Value 1 -Id 'REG-UAC-SecureDesktop' -Area 'UAC' | Out-Null
     Set-CPReg -Path $pol -Name 'FilterAdministratorToken'   -Value 1 -Id 'REG-UAC-FilterAdmin'   -Area 'UAC' | Out-Null
-    Set-CPReg -Path $pol -Name 'EnableInstallerDetection'  -Value 1 | Out-Null
-    Set-CPReg -Path $pol -Name 'EnableVirtualization'      -Value 1 | Out-Null
-    Set-CPReg -Path $pol -Name 'EnableSecureUIAPaths'      -Value 1 | Out-Null
-    Set-CPReg -Path $pol -Name 'DisableCAD'                -Value 0 -Id 'REG-CAD' -Area 'UAC' | Out-Null
-    Set-CPReg -Path $pol -Name 'DontDisplayLastUserName'   -Value 1 -Id 'REG-LastUser' -Area 'UAC' | Out-Null
-    Set-CPReg -Path $pol -Name 'ShutdownWithoutLogon'      -Value 0 -Id 'REG-ShutdownNoLogon' -Area 'UAC' | Out-Null
-    Set-CPReg -Path $pol -Name 'InactivityTimeoutSecs'     -Value 900 | Out-Null
+    Set-CPReg -Path $pol -Name 'EnableInstallerDetection'   -Value 1 | Out-Null
+    Set-CPReg -Path $pol -Name 'EnableVirtualization'       -Value 1 | Out-Null
+    Set-CPReg -Path $pol -Name 'EnableSecureUIAPaths'       -Value 1 | Out-Null
+    Set-CPReg -Path $pol -Name 'DisableCAD'                 -Value 0 -Id 'REG-CAD' -Area 'UAC' | Out-Null
+    Set-CPReg -Path $pol -Name 'DontDisplayLastUserName'    -Value 1 -Id 'REG-LastUser' -Area 'UAC' | Out-Null
+    Set-CPReg -Path $pol -Name 'ShutdownWithoutLogon'       -Value 0 -Id 'REG-ShutdownNoLogon' -Area 'UAC' | Out-Null
+    Set-CPReg -Path $pol -Name 'UndockWithoutLogon'         -Value 0 | Out-Null
+    Set-CPReg -Path $pol -Name 'NoConnectedUser'            -Value 3 | Out-Null
+    Set-CPReg -Path $pol -Name 'InactivityTimeoutSecs'      -Value 900 | Out-Null
     Set-CPReg -Path $pol -Name 'LegalNoticeCaption' -Value 'AUTHORIZED USE ONLY' -Type String -Id 'REG-Banner' -Area 'Policy' | Out-Null
     Set-CPReg -Path $pol -Name 'LegalNoticeText' -Type String -Id 'REG-BannerText' -Area 'Policy' `
         -Value 'This information system is the property of the organization and is provided for authorized use only. Unauthorized access, use, or modification is prohibited and may result in disciplinary, civil, and criminal penalties. All activity on this system is logged, monitored, and subject to audit.' | Out-Null
@@ -1508,16 +1856,17 @@ function Invoke-Registry {
     }
 
     $exp = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer'
-    Set-CPReg -Path $exp -Name 'NoDriveTypeAutoRun'   -Value 255 -Id 'REG-Autorun' -Area 'Registry' | Out-Null
-    Set-CPReg -Path $exp -Name 'NoAutorun'            -Value 1 | Out-Null
+    Set-CPReg -Path $exp -Name 'NoDriveTypeAutoRun'     -Value 255 -Id 'REG-Autorun' -Area 'Registry' | Out-Null
+    Set-CPReg -Path $exp -Name 'NoAutorun'              -Value 1 | Out-Null
     Set-CPReg -Path $exp -Name 'NoAutoplayfornonVolume' -Value 1 | Out-Null
     Set-CPReg -Path 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer' -Name 'NoDriveTypeAutoRun' -Value 255 | Out-Null
 
     $att = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Attachments'
     Set-CPReg -Path $att -Name 'SaveZoneInformation'      -Value 1 -Id 'REG-ZoneInfo' -Area 'Registry' | Out-Null
     Set-CPReg -Path $att -Name 'HideZoneInfoOnProperties' -Value 1 | Out-Null
+    Set-CPReg -Path $att -Name 'ScanWithAntiVirus'        -Value 3 | Out-Null
 
-    # ---- RDP: keep it UP by default (README may need it) but force NLA -----
+    # ---- RDP + Remote Assistance: enforce NLA/encryption without enabling RDP!
     $rdp    = 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server'
     $rdpPol = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
     Set-CPReg -Path "$rdp\WinStations\RDP-Tcp" -Name 'UserAuthentication' -Value 1 -Id 'REG-RDP-NLA' -Area 'RDP' | Out-Null
@@ -1527,16 +1876,22 @@ function Invoke-Registry {
     Set-CPReg -Path $rdpPol -Name 'MinEncryptionLevel'    -Value 3 | Out-Null
     Set-CPReg -Path $rdpPol -Name 'SecurityLayer'         -Value 2 | Out-Null
     Set-CPReg -Path $rdpPol -Name 'UserAuthentication'    -Value 1 | Out-Null
-    Set-CPReg -Path $rdpPol -Name 'fDenyTSConnections'    -Value 0 | Out-Null
-    Set-CPReg -Path $rdp    -Name 'fDenyTSConnections'    -Value 0 | Out-Null
-    if ($Aggressive) {
-        if (Confirm-CP 'AGGRESSIVE: fully disable RDP? Do NOT do this if the README lists remote access as a critical service.') {
+    # Always disable Remote Assistance (frequently scored separately from RDP)
+    $ra = 'HKLM:\SYSTEM\CurrentControlSet\Control\Remote Assistance'
+    Set-CPReg -Path $ra -Name 'fAllowToGetHelp'   -Value 0 -Id 'REG-RemoteAssist' -Area 'RDP' | Out-Null
+    Set-CPReg -Path $ra -Name 'fAllowFullControl' -Value 0 | Out-Null
+
+    $rdpCur = Get-CPReg -Path $rdp -Name 'fDenyTSConnections'
+    if ($rdpCur -eq 1) {
+        Set-CPReg -Path $rdpPol -Name 'fDenyTSConnections' -Value 1 -Id 'REG-RDP-Deny' -Area 'RDP' | Out-Null
+    } elseif ($script:Agg -or (-not $Force -and (Confirm-CP 'RDP is currently ENABLED (fDenyTSConnections=0). Disable RDP? Say NO if README requires Remote Desktop.'))) {
+        if (-not $script:Agg -or (Confirm-CP 'AGGRESSIVE: fully disable RDP? Do NOT do this if the README lists remote access as a critical service.')) {
             Set-CPReg -Path $rdp    -Name 'fDenyTSConnections' -Value 1 -Id 'REG-RDP-Deny' -Area 'RDP' | Out-Null
             Set-CPReg -Path $rdpPol -Name 'fDenyTSConnections' -Value 1 | Out-Null
         }
     } else {
-        Add-Finding -Id 'REG-RDP-Deny' -Area 'RDP' -Status 'INFO' -Detail 'RDP left enabled (NLA + high encryption enforced)' `
-            -Hint 'Re-run with -Aggressive to fully disable RDP, once you have confirmed it is not a critical service in the README.'
+        Add-Finding -Id 'REG-RDP-Deny' -Area 'RDP' -Status 'WARN' -Detail 'RDP currently enabled (NLA + high encryption enforced)' `
+            -Hint 'If README does not require Remote Desktop, disable it (fDenyTSConnections=1) or run with -Aggressive.'
     }
 
     # ---- WinRM ------------------------------------------------------------
@@ -1549,14 +1904,20 @@ function Invoke-Registry {
     Set-CPReg -Path $wrC -Name 'AllowUnencryptedTraffic' -Value 0 | Out-Null
     Set-CPReg -Path $wrC -Name 'AllowDigest'             -Value 0 | Out-Null
 
-    # ---- SMB signing --------------------------------------------------------
+    # ---- SMB signing + null session hardening ----------------------------
     $srv  = 'HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters'
     $wkst = 'HKLM:\SYSTEM\CurrentControlSet\Services\LanmanWorkstation\Parameters'
-    Set-CPReg -Path $srv  -Name 'RequireSecuritySignature' -Value 1 -Id 'REG-SMBSign-Server' -Area 'SMB' | Out-Null
-    Set-CPReg -Path $srv  -Name 'EnableSecuritySignature'  -Value 1 | Out-Null
+    Set-CPReg -Path $srv  -Name 'RequireSecuritySignature'  -Value 1 -Id 'REG-SMBSign-Server' -Area 'SMB' | Out-Null
+    Set-CPReg -Path $srv  -Name 'EnableSecuritySignature'   -Value 1 | Out-Null
     Set-CPReg -Path $srv  -Name 'EnableInsecureGuestLogons' -Value 0 -Id 'REG-GuestLogons' -Area 'SMB' | Out-Null
-    Set-CPReg -Path $wkst -Name 'RequireSecuritySignature' -Value 1 -Id 'REG-SMBSign-Client' -Area 'SMB' | Out-Null
-    Set-CPReg -Path $wkst -Name 'EnableSecuritySignature'  -Value 1 | Out-Null
+    Set-CPReg -Path $srv  -Name 'RestrictNullSessAccess'    -Value 1 -Id 'REG-NullSess' -Area 'SMB' | Out-Null
+    Set-CPReg -Path $srv  -Name 'NullSessionPipes'          -Value ([string[]]@()) -Type MultiString | Out-Null
+    Set-CPReg -Path $srv  -Name 'NullSessionShares'         -Value ([string[]]@()) -Type MultiString | Out-Null
+    Set-CPReg -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\SecurePipeServers\winreg\AllowedExactPaths' -Name 'Machine' -Value ([string[]]@()) -Type MultiString | Out-Null
+    Set-CPReg -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\SecurePipeServers\winreg\AllowedPaths'      -Name 'Machine' -Value ([string[]]@()) -Type MultiString | Out-Null
+    Set-CPReg -Path $wkst -Name 'RequireSecuritySignature'  -Value 1 -Id 'REG-SMBSign-Client' -Area 'SMB' | Out-Null
+    Set-CPReg -Path $wkst -Name 'EnableSecuritySignature'   -Value 1 | Out-Null
+    Set-CPReg -Path $wkst -Name 'EnablePlainTextPassword'   -Value 0 -Id 'REG-PlainTextSMB' -Area 'SMB' | Out-Null
     Set-CPReg -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\LanmanWorkstation' -Name 'AllowInsecureGuestAuth' -Value 0 | Out-Null
 
     # ---- PrintNightmare (CVE-2021-34527) -------------------------------------
@@ -1605,14 +1966,41 @@ function Invoke-Registry {
     Set-CPReg -Path "$psl\Transcription" -Name 'OutputDirectory' -Value (Join-Path $script:Root 'pslogs') -Type String | Out-Null
     New-Item -ItemType Directory -Path (Join-Path $script:Root 'pslogs') -Force -ErrorAction SilentlyContinue | Out-Null
 
-    # ---- smart screen + windows update policy + installer ---------------------
+    # ---- smart screen + windows update policy + installer + Office + DEP ----
     Set-CPReg -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System' -Name 'EnableSmartScreen'     -Value 1 -Id 'REG-SmartScreen' -Area 'Registry' | Out-Null
     Set-CPReg -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System' -Name 'ShellSmartScreenLevel' -Value 'Block' -Type String | Out-Null
-    Set-CPReg -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU' -Name 'NoAutoUpdate'  -Value 0 -Id 'REG-WU' -Area 'Updates' | Out-Null
-    Set-CPReg -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU' -Name 'AUOptions'     -Value 4 | Out-Null
-    Set-CPReg -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU' -Name 'AutomaticMaintenanceEnabled' -Value 1 | Out-Null
+    Set-CPReg -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer' -Name 'SmartScreenEnabled' -Value 'RequireAdmin' -Type String -Id 'REG-SmartScreen-Explorer' -Area 'Registry' | Out-Null
+    Set-CPReg -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\AppHost'  -Name 'EnableWebContentEvaluation' -Value 1 | Out-Null
+    Set-CPReg -Path 'HKLM:\SOFTWARE\Policies\Microsoft\MicrosoftEdge\PhishingFilter' -Name 'EnabledV9' -Value 1 | Out-Null
+    Set-CPReg -Path 'HKLM:\SOFTWARE\Policies\Microsoft\MicrosoftEdge\PhishingFilter' -Name 'PreventOverride' -Value 1 | Out-Null
+    Set-CPReg -Path 'HKLM:\SOFTWARE\Policies\Microsoft\MicrosoftEdge\PhishingFilter' -Name 'PreventOverrideAppRepUnknown' -Value 1 | Out-Null
+    Set-CPReg -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Edge' -Name 'SmartScreenEnabled'    -Value 1 | Out-Null
+    Set-CPReg -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Edge' -Name 'SmartScreenPuaEnabled' -Value 1 | Out-Null
+
+    $wuAu = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU'
+    Set-CPReg -Path $wuAu -Name 'NoAutoUpdate'                -Value 0 -Id 'REG-WU' -Area 'Updates' | Out-Null
+    Set-CPReg -Path $wuAu -Name 'AUOptions'                   -Value 4 | Out-Null
+    Set-CPReg -Path $wuAu -Name 'AutoInstallMinorUpdates'     -Value 1 | Out-Null
+    Set-CPReg -Path $wuAu -Name 'AutomaticMaintenanceEnabled' -Value 1 | Out-Null
+    Set-CPReg -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update' -Name 'AUOptions' -Value 4 | Out-Null
+    Set-CPReg -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate' -Name 'DisableWindowsUpdateAccess' -Value 0 | Out-Null
+    Set-CPReg -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate' -Name 'ElevateNonAdmins' -Value 0 | Out-Null
+    Set-CPReg -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Policies\Explorer' -Name 'NoWindowsUpdate' -Value 0 | Out-Null
+
     Set-CPReg -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Installer' -Name 'AlwaysInstallElevated' -Value 0 -Id 'REG-InstallerElevated' -Area 'Registry' | Out-Null
     Set-CPReg -Path 'HKCU:\SOFTWARE\Policies\Microsoft\Windows\Installer' -Name 'AlwaysInstallElevated' -Value 0 | Out-Null
+
+    # Office 16.0 macro / internet execution hardening
+    foreach ($app in @('word','excel','powerpoint')) {
+        $okKey = "HKCU:\Software\Policies\Microsoft\Office\16.0\$app\security"
+        Set-CPReg -Path $okKey -Name 'vbawarnings' -Value 4 | Out-Null
+        Set-CPReg -Path $okKey -Name 'blockcontentexecutionfrominternet' -Value 1 | Out-Null
+    }
+
+    # Best-effort hardware DEP (AlwaysOn)
+    Invoke-CP 'enable hardware DEP (bcdedit AlwaysOn)' {
+        $null = & bcdedit.exe /set "{current}" nx AlwaysOn 2>&1
+    } | Out-Null
 
     # ---- internet zones: protected mode + popup blocker -----------------------
     foreach ($zone in @('1','2','3','4')) {
@@ -1635,7 +2023,7 @@ function Invoke-Registry {
 # ------------------------------------------------------------------------------
 function Invoke-Network {
     Write-Banner 'NETWORK / FIREWALL / SMB'
-    if ($Paranoid) { Write-CP 'paranoid mode: network pass skipped' 'warn'; return }
+    if ($script:Para) { Write-CP 'paranoid mode: network pass skipped' 'warn'; return }
 
     Invoke-CP 'firewall profiles on, inbound blocked by default' {
         $netOk = $true
@@ -1675,7 +2063,7 @@ function Invoke-Network {
     # wide-open inbound allow rules defeat the whole firewall. rules with no
     # display group are usually hand-made -- the sneaky ones live there.
     Invoke-CP 'permissive inbound rule scan' {
-        $bad = @()
+        $bad = New-Object System.Collections.Generic.List[object]
         try {
             $rules = @(Get-NetFirewallRule -ErrorAction Stop | Where-Object {
                 $_.Enabled -eq 'True' -and $_.Direction -eq 'Inbound' -and $_.Action -eq 'Allow'
@@ -1687,7 +2075,7 @@ function Invoke-Network {
                 $anyProto = (-not $pf)   -or (-not $pf.Protocol)   -or ($pf.Protocol -eq 'Any')
                 $anyAddr  = (-not $addr) -or ((@($addr.RemoteAddress) -join ',') -match 'Any')
                 if ($anyPort -and $anyProto -and $anyAddr) {
-                    $bad += [pscustomobject]@{ Name=$r.DisplayName; Profile=$r.Profile }
+                    $bad.Add([pscustomobject]@{ Name=$r.DisplayName; Profile=$r.Profile })
                 }
             }
         } catch { Write-CP ("could not enumerate firewall rules: " + $_.Exception.Message) 'warn' }
@@ -1696,7 +2084,7 @@ function Invoke-Network {
             Add-Finding -Id 'FW-PERMISSIVE' -Area 'Firewall' -Status 'FAIL' -Detail "$($bad.Count) allow-ALL-inbound rule(s)" `
                 -Hint 'An "allow all inbound" rule defeats the whole firewall. Delete it unless the README demands it.'
             foreach ($b in $bad) { Write-Host ("     - {0}" -f $b.Name) -ForegroundColor DarkYellow }
-            if ($Aggressive -and (Confirm-CP "AGGRESSIVE: disable $($bad.Count) wide-open inbound allow rule(s)?")) {
+            if ($script:Agg -and (Confirm-CP "AGGRESSIVE: disable $($bad.Count) wide-open inbound allow rule(s)?")) {
                 foreach ($b in $bad) {
                     Get-NetFirewallRule -DisplayName $b.Name -ErrorAction SilentlyContinue |
                         Disable-NetFirewallRule -ErrorAction SilentlyContinue
@@ -1708,11 +2096,73 @@ function Invoke-Network {
         }
     }
 
-    # SMBv1 -- always safe to kill
-    Invoke-CP 'SMBv1 disable' {
-        $f = Get-WindowsOptionalFeature -Online -FeatureName SMB1Protocol -ErrorAction SilentlyContinue
-        if ($f -and $f.State -eq 'Enabled') {
-            Disable-WindowsOptionalFeature -Online -FeatureName SMB1Protocol -NoRestart -ErrorAction SilentlyContinue | Out-Null
+    # Optional -Aggressive LOLBin outbound firewall block rules
+    if ($script:Agg -and (Confirm-CP 'AGGRESSIVE: add outbound firewall block rules for common LOLBins (mshta/certutil/regsvr32/wscript/cscript/hh/cmstp/pcalua)?')) {
+        Invoke-CP 'LOLBin outbound firewall rules' {
+            $lolbins = @(
+                "$env:windir\System32\mshta.exe",
+                "$env:windir\System32\certutil.exe",
+                "$env:windir\System32\regsvr32.exe",
+                "$env:windir\System32\wscript.exe",
+                "$env:windir\System32\cscript.exe",
+                "$env:windir\hh.exe",
+                "$env:windir\System32\cmstp.exe",
+                "$env:windir\System32\pcalua.exe"
+            )
+            foreach ($lb in $lolbins) {
+                if (-not (Test-Path $lb)) { continue }
+                $rName = 'cbpt-Block-' + [IO.Path]::GetFileName($lb)
+                if (-not (Get-NetFirewallRule -DisplayName $rName -ErrorAction SilentlyContinue)) {
+                    New-NetFirewallRule -DisplayName $rName -Direction Outbound -Action Block `
+                        -Program $lb -Profile Any -Enabled True -ErrorAction SilentlyContinue | Out-Null
+                }
+            }
+            Add-Finding -Id 'FW-LOLBIN' -Area 'Firewall' -Status 'PASS' -Detail 'LOLBin outbound block rules applied'
+        } | Out-Null
+    }
+
+    # non-default & hidden SMB share remediation
+    Invoke-CP 'non-default SMB share remediation' {
+        try {
+            $customShares = @(Get-SmbShare -ErrorAction Stop | Where-Object {
+                $_.Name -notmatch '^(ADMIN\$|IPC\$|print\$|SYSVOL|NETLOGON|[A-Z]\$)$'
+            })
+            foreach ($cs in $customShares) {
+                Write-CP ("custom/hidden share found: '{0}' -> {1}" -f $cs.Name, $cs.Path) 'warn'
+                if ($Force -or (Confirm-CP ("Remove SMB share '{0}' ({1})? Say NO if README requires file sharing." -f $cs.Name, $cs.Path))) {
+                    Remove-SmbShare -Name $cs.Name -Force -ErrorAction Stop
+                    Register-Change -What "SMB Share $($cs.Name)" -Old $cs.Path -New 'removed'
+                    Add-Finding -Id "SHARE-REM-$($cs.Name)" -Area 'Shares' -Status 'PASS' -Detail "removed share $($cs.Name)"
+                }
+            }
+        } catch {}
+    }
+
+    # SMBv1 & risky Windows Optional / Server Features
+    Invoke-CP 'SMBv1 + risky Windows Optional Features disable' {
+        $optFeats = @('SMB1Protocol','SimpleTCP','TelnetClient','TelnetServer','TFTP',
+                      'MicrosoftWindowsPowerShellV2','MicrosoftWindowsPowerShellV2Root',
+                      'WorkFolders-Client','Printing-LPDPrintService','Printing-LPRPortMonitor')
+        foreach ($fn in $optFeats) {
+            try {
+                $f = Get-WindowsOptionalFeature -Online -FeatureName $fn -ErrorAction Stop
+                if ($f -and $f.State -eq 'Enabled') {
+                    Disable-WindowsOptionalFeature -Online -FeatureName $fn -NoRestart -ErrorAction SilentlyContinue | Out-Null
+                    Register-Change -What "OptionalFeature $fn" -Old 'Enabled' -New 'Disabled'
+                    Add-Finding -Id "FEAT-$fn" -Area 'Features' -Status 'PASS' -Detail "disabled feature $fn"
+                }
+            } catch {}
+        }
+        if (Get-Command Get-WindowsFeature -ErrorAction SilentlyContinue) {
+            foreach ($sfn in @('Telnet-Client','TFTP-Client','SNMP-Service','FS-SMB1','Simple-TCPIP')) {
+                try {
+                    $sf = Get-WindowsFeature -Name $sfn -ErrorAction Stop
+                    if ($sf -and $sf.Installed) {
+                        Uninstall-WindowsFeature -Name $sfn -ErrorAction SilentlyContinue | Out-Null
+                        Register-Change -What "ServerFeature $sfn" -Old 'Installed' -New 'Removed'
+                    }
+                } catch {}
+            }
         }
         try { Set-SmbServerConfiguration -EnableSMB1Protocol $false -Force -ErrorAction Stop } catch {}
         Set-CPReg 'HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters' 'SMB1' 0 | Out-Null
@@ -1747,7 +2197,7 @@ function Invoke-Network {
     Set-CPReg -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient' -Name 'EnableMulticast' -Value 0 -Id 'NET-LLMNR' -Area 'Network' | Out-Null
 
     # NetBIOS / admin shares -- aggressive only, some scoring uses WINS names
-    if ($Aggressive) {
+    if ($script:Agg) {
         Invoke-CP 'NetBIOS over TCP/IP off' {
             foreach ($a in @(Get-CimInstance Win32_NetworkAdapterConfiguration -Filter 'IPEnabled=True' -ErrorAction SilentlyContinue)) {
                 $null = $a.SetTcpipNetbios(2)
@@ -1767,7 +2217,7 @@ function Invoke-Network {
     Invoke-CP 'WinRM listener check' {
         $l = & winrm enumerate winrm/config/listener 2>&1
         if ("$l" -match 'Transport') {
-            if ($Aggressive) {
+            if ($script:Agg) {
                 $null = & winrm delete 'winrm/config/listener?Address=*+Transport=HTTP' 2>&1
                 Add-Finding -Id 'NET-WinRM' -Area 'Network' -Status 'PASS' -Detail 'HTTP WinRM listener removed'
             } else {
@@ -1810,7 +2260,7 @@ function Disable-CPService {
 
 function Invoke-Services {
     Write-Banner 'SERVICES'
-    if ($Paranoid) { Write-CP 'paranoid mode: service pass skipped' 'warn'; return }
+    if ($script:Para) { Write-CP 'paranoid mode: service pass skipped' 'warn'; return }
 
     $safeOff = @(
         @{n='RemoteRegistry';     why='remote registry access'},
@@ -1828,6 +2278,17 @@ function Invoke-Services {
         @{n='RemoteAccess';       why='Routing and Remote Access'},
         @{n='SessionEnv';         why='Remote Desktop Configuration'},
         @{n='UmRdpService';       why='RDP UserMode Port Redirector'},
+        @{n='HomeGroupListener';  why='legacy HomeGroup listener'},
+        @{n='HomeGroupProvider';  why='legacy HomeGroup provider'},
+        @{n='lltdsvc';            why='Link-Layer Topology Discovery'},
+        @{n='p2pimsvc';           why='Peer Networking Identity Manager'},
+        @{n='p2psvc';             why='Peer Networking Grouping'},
+        @{n='PNRPsvc';            why='Peer Name Resolution Protocol'},
+        @{n='iprip';              why='RIP Listener'},
+        @{n='TapiSrv';            why='Telephony'},
+        @{n='NetTcpPortSharing';  why='Net.Tcp Port Sharing'},
+        @{n='RasAuto';            why='Remote Access Auto Connection Manager'},
+        @{n='RasMan';             why='Remote Access Connection Manager'},
         @{n='lfsvc';              why='Geolocation'},
         @{n='RetailDemo';         why='Retail demo'},
         @{n='XblAuthManager';     why='Xbox Live auth'},
@@ -1842,6 +2303,9 @@ function Invoke-Services {
 
     $aggOff = @(
         @{n='FTPSVC';      why='IIS FTP server'},
+        @{n='Msftpsvc';    why='legacy IIS FTP service'},
+        @{n='WINS';        why='Windows Internet Name Service'},
+        @{n='Spooler';     why='Print Spooler (disable if no printer needed)'},
         @{n='SNMP';        why='SNMP service'},
         @{n='SNMPTRAP';    why='SNMP trap'},
         @{n='WinRM';       why='Windows Remote Management'},
@@ -1857,6 +2321,7 @@ function Invoke-Services {
     $mustOn = @(
         @{n='WinDefend';             st='Automatic'; why='Defender service'},
         @{n='wuauserv';              st='Automatic'; why='Windows Update'},
+        @{n='UsoSvc';                st='Manual';    why='Update Orchestrator Service'},
         @{n='BITS';                  st='Automatic'; why='background transfer'},
         @{n='EventLog';              st='Automatic'; why='event log'},
         @{n='MpsSvc';                st='Automatic'; why='Windows Firewall'},
@@ -1873,7 +2338,7 @@ function Invoke-Services {
 
     foreach ($s in $safeOff) { Disable-CPService -svc $s }
 
-    if ($Aggressive) {
+    if ($script:Agg) {
         Write-CP 'aggressive tier: these are frequently THE critical service' 'warn'
         foreach ($s in $aggOff) {
             $svc = Get-CPService $s.n
@@ -1886,7 +2351,7 @@ function Invoke-Services {
             }
         }
     } else {
-        Add-Finding -Id 'SVC-AGG' -Area 'Services' -Status 'INFO' -Detail 'web/db/FTP/DNS services left alone' `
+        Add-Finding -Id 'SVC-AGG' -Area 'Services' -Status 'INFO' -Detail 'web/db/FTP/DNS/Spooler services left alone' `
             -Hint 'Re-run with -Aggressive if the README confirms none are critical. Otherwise HARDEN their config instead of stopping them.'
     }
 
@@ -1919,7 +2384,7 @@ function Invoke-Services {
 # ------------------------------------------------------------------------------
 function Invoke-Defender {
     Write-Banner 'DEFENDER / AUDIT / UPDATES'
-    if ($Paranoid) { Write-CP 'paranoid mode: defender pass skipped' 'warn'; return }
+    if ($script:Para) { Write-CP 'paranoid mode: defender pass skipped' 'warn'; return }
 
     Invoke-CP 'defender service re-enabled' {
         $s = Get-CPService 'WinDefend'
@@ -1929,12 +2394,16 @@ function Invoke-Defender {
         }
     }
 
-    # a policy key can silently switch Defender off -- clear it first
-    Invoke-CP 'clear Defender-disabling policy values' {
+    # a policy key can silently switch Defender off -- clear it first & enforce hygiene
+    Invoke-CP 'clear Defender-disabling policies + enforce Defender policy hygiene' {
         $pk = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender'
         Remove-ItemProperty -Path $pk -Name 'DisableAntiSpyware' -ErrorAction SilentlyContinue
         Remove-ItemProperty -Path $pk -Name 'DisableAntiVirus'   -ErrorAction SilentlyContinue
         Remove-ItemProperty -Path "$pk\Real-Time Protection" -Name 'DisableRealtimeMonitoring' -ErrorAction SilentlyContinue
+        Set-CPReg -Path $pk -Name 'ServiceKeepAlive' -Value 1 | Out-Null
+        Set-CPReg -Path "$pk\Scan" -Name 'CheckForSignaturesBeforeRunningScan' -Value 1 | Out-Null
+        Set-CPReg -Path "$pk\Scan" -Name 'DisableHeuristics' -Value 0 | Out-Null
+        Set-CPReg -Path "$pk\Real-Time Protection" -Name 'DisableIOAVProtection' -Value 0 | Out-Null
     }
 
     Invoke-CP 'defender preferences (realtime/behavior/PUA/MAPS)' {
@@ -1964,9 +2433,10 @@ function Invoke-Defender {
             '26190899-1602-49e8-8b27-eb1d0a1ce869' = 1   # office comm app children
             'e6db77e5-3df2-4cf1-b95a-636979351e5b' = 1   # WMI persistence
         }
-        $ids = @(); $acts = @()
-        foreach ($k in $asr.Keys) { $ids += $k; $acts += $asr[$k] }
-        Set-MpPreference -AttackSurfaceReductionRules_Ids $ids -AttackSurfaceReductionRules_Actions $acts -ErrorAction SilentlyContinue
+        $ids = New-Object System.Collections.Generic.List[string]
+        $acts = New-Object System.Collections.Generic.List[int]
+        foreach ($k in $asr.Keys) { $ids.Add($k); $acts.Add($asr[$k]) }
+        Set-MpPreference -AttackSurfaceReductionRules_Ids $ids.ToArray() -AttackSurfaceReductionRules_Actions $acts.ToArray() -ErrorAction SilentlyContinue
         Set-MpPreference -EnableNetworkProtection Enabled -ErrorAction SilentlyContinue
         Set-MpPreference -EnableControlledFolderAccess Enabled -ErrorAction SilentlyContinue
     }
@@ -1974,15 +2444,15 @@ function Invoke-Defender {
     # exclusions are where "disabled AV" hides on CP images
     Invoke-CP 'defender exclusion inventory' {
         $pref = Get-MpPreference -ErrorAction SilentlyContinue
-        $rows = @()
-        foreach ($x in @($pref.ExclusionPath))      { if ($x) { $rows += [pscustomobject]@{Type='Path';Value=$x} } }
-        foreach ($x in @($pref.ExclusionProcess))   { if ($x) { $rows += [pscustomobject]@{Type='Process';Value=$x} } }
-        foreach ($x in @($pref.ExclusionExtension)) { if ($x) { $rows += [pscustomobject]@{Type='Extension';Value=$x} } }
+        $rows = New-Object System.Collections.Generic.List[object]
+        foreach ($x in @($pref.ExclusionPath))      { if ($x) { $rows.Add([pscustomobject]@{Type='Path';Value=$x}) } }
+        foreach ($x in @($pref.ExclusionProcess))   { if ($x) { $rows.Add([pscustomobject]@{Type='Process';Value=$x}) } }
+        foreach ($x in @($pref.ExclusionExtension)) { if ($x) { $rows.Add([pscustomobject]@{Type='Extension';Value=$x}) } }
         $rows | Export-Csv (Join-Path $script:EvDir 'defender-exclusions.csv') -NoTypeInformation
         if ($rows.Count -gt 0) {
             Add-Finding -Id 'DEF-EXCL' -Area 'Defender' -Status 'WARN' -Detail "$($rows.Count) Defender exclusion(s) inventoried" `
                 -Hint 'An exclusion covering C:\ or *.exe is "AV turned off" with extra steps. Remove it unless the README justifies it: Remove-MpPreference -ExclusionPath <path>'
-            if (-not ($Paranoid -or $script:Dry)) {
+            if (-not ($script:Para -or $script:Dry)) {
                 Write-Host ''
                 $c = Read-Host '  remove ALL Defender exclusions? (y/N)'
                 if ($c -match '^[Yy]') {
@@ -2011,9 +2481,14 @@ function Invoke-Defender {
             -Hint $(if ($mp.RealTimeProtectionEnabled) {''} else {'Tamper protection can block the change. Reboot and re-check, or fix via Windows Security UI.'})
     } catch {}
 
-    # quick scan only. a full scan eats the clock and the clock is points.
-    Invoke-CP 'defender quick scan + threat history' {
-        Start-MpScan -ScanType QuickScan -ErrorAction SilentlyContinue
+    # quick scan runs non-blocking in background job (unless -SkipScan) so it doesn't stall the clock
+    Invoke-CP 'defender threat history + background quick scan' {
+        if (-not $SkipScan) {
+            try { Start-Job -ScriptBlock { Start-MpScan -ScanType QuickScan -ErrorAction SilentlyContinue } -ErrorAction SilentlyContinue | Out-Null } catch {}
+            Write-CP 'Defender QuickScan launched in background job (use Get-Job to check)' 'info'
+        } else {
+            Write-CP 'QuickScan skipped (-SkipScan)' 'info'
+        }
         $t = @(Get-MpThreatDetection -ErrorAction SilentlyContinue)
         $t | Export-Csv (Join-Path $script:EvDir 'defender-threats.csv') -NoTypeInformation
         if ($t.Count -gt 0) {
@@ -2041,8 +2516,8 @@ function Invoke-Defender {
     }
 
     Invoke-CP 'advanced audit policy (auditpol)' {
-        # secedit sets the legacy flags; auditpol gives the subcategories the
-        # scoring engine actually reads.
+        # Ensure subcategory override is active alongside auditpol subcategories
+        Set-CPReg 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' 'SCENoApplyLegacyAuditPolicy' 1 | Out-Null
         $auditOk = $true
         foreach ($cat in @('System','Logon/Logoff','Object Access','Privilege Use','Detailed Tracking',
                            'Policy Change','Account Management','DS Access','Account Logon')) {
@@ -2186,22 +2661,185 @@ function Invoke-Apps {
         Add-Finding -Id 'APP-MSSQL' -Area 'Apps' -Status 'INFO' -Detail 'SQL Server present, manual checks required' `
             -Hint 'Disable/rename sa + strong password; Windows-only auth unless the README requires mixed mode; remove BUILTIN\Users login; confirm SQL Browser is off.'
     }
+
+    # ---- Windows OpenSSH Server ---------------------------------------------
+    $sshCfg = Join-Path $env:ProgramData 'ssh\sshd_config'
+    if ((Get-CPService 'sshd') -or (Test-Path $sshCfg)) {
+        Write-CP 'Windows OpenSSH Server detected' 'head'
+        if ((Test-Path $sshCfg) -and -not ($script:Para -or $script:Dry)) {
+            Invoke-CP 'harden Windows sshd_config' {
+                Backup-CPFile $sshCfg
+                $bak = "$sshCfg.cbptbak"
+                Copy-Item -LiteralPath $sshCfg -Destination $bak -Force
+                $lines = New-Object System.Collections.Generic.List[string]
+                foreach ($ln in (Get-Content -LiteralPath $sshCfg -ErrorAction Stop)) { $lines.Add($ln) }
+                $opts = [ordered]@{
+                    'PermitRootLogin'        = 'no'
+                    'PermitEmptyPasswords'   = 'no'
+                    'MaxAuthTries'           = '3'
+                    'X11Forwarding'          = 'no'
+                    'AllowAgentForwarding'   = 'no'
+                    'AllowTcpForwarding'     = 'no'
+                    'ClientAliveInterval'    = '300'
+                    'ClientAliveCountMax'    = '2'
+                    'LoginGraceTime'         = '60'
+                    'UseDNS'                 = 'no'
+                }
+                foreach ($k in $opts.Keys) {
+                    $set = $false
+                    for ($i = 0; $i -lt $lines.Count; $i++) {
+                        if ($lines[$i] -match ("^\s*#?\s*{0}\b" -f [regex]::Escape($k))) {
+                            if (-not $set) { $lines[$i] = "$k $($opts[$k])"; $set = $true }
+                        }
+                    }
+                    if (-not $set) { $lines.Add("$k $($opts[$k])") }
+                }
+                Set-Content -LiteralPath $sshCfg -Value $lines -Encoding ASCII
+                $sshdExe = @(Get-Command sshd.exe -ErrorAction SilentlyContinue | Select-Object -First 1).Source
+                if (-not $sshdExe -and (Test-Path "$env:windir\System32\OpenSSH\sshd.exe")) { $sshdExe = "$env:windir\System32\OpenSSH\sshd.exe" }
+                if ($sshdExe) {
+                    $null = & $sshdExe -t -f $sshCfg 2>&1
+                    if ($LASTEXITCODE -ne 0) {
+                        Copy-Item -LiteralPath $bak -Destination $sshCfg -Force
+                        Remove-Item -LiteralPath $bak -Force -ErrorAction SilentlyContinue
+                        throw 'sshd.exe -t validation failed; rolled back sshd_config'
+                    }
+                }
+                Remove-Item -LiteralPath $bak -Force -ErrorAction SilentlyContinue
+                $ssvc = Get-CPService 'sshd'
+                if ($ssvc -and $ssvc.Status -eq 'Running') { Restart-Service sshd -Force -ErrorAction SilentlyContinue }
+                Add-Finding -Id 'APP-OPENSSH' -Area 'Apps' -Status 'PASS' -Detail 'Windows OpenSSH sshd_config hardened + validated'
+            } | Out-Null
+        } else {
+            Add-Finding -Id 'APP-OPENSSH' -Area 'Apps' -Status 'INFO' -Detail "OpenSSH config at $sshCfg (dry-run/paranoid or missing)"
+        }
+    }
 }
 
 # ------------------------------------------------------------------------------
-# file inventory (media / password files / user executables). NOTHING deleted.
+# software audit / outdated apps / interactive uninstall helper
+# ------------------------------------------------------------------------------
+function Invoke-Software {
+    Write-Banner 'SOFTWARE AUDIT & UPDATES'
+
+    $paths = @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+               'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*',
+               'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*')
+    $p = @(Get-ItemProperty $paths -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName })
+    $suspect = '(?i)teamviewer|ammyy|anydesk|logmein|vnc|tightvnc|realvnc|ultravnc|tigervnc|radmin|rustdesk|parsec|ngrok|hamachi|zerotier|nmap|zenmap|wireshark|fiddler|charles|winpcap|npcap|mimikatz|rubeus|sharphound|bloodhound|netcat|ncat|putty|filezilla|winscp|cyberduck|tftp|torrent|utorrent|bittorrent|qbittorrent|deluge|transmission|frostwire|vuze|xmrig|minergate|keylog|procexp|procmon|process hacker|nirsoft|pwdump|fgdump|quarks|psexec|hydra|john|hashcat|ophcrack|cain|abel|angry ip|angryip|advanced ip|advanced port|metasploit|burp|nessus|aircrack|sqlmap|nikto|gobuster|dirb|ettercap|bettercap|ghidra|x64dbg|ollydbg|cheat engine|autohotkey|wildtangent|windirstat|ccleaner|bonjour|tor browser|openvpn|emule|skype|discord|steam|epic games|battle\.net|riot|roblox|minecraft|origin|ea app|uplay|gog galaxy'
+    $hits = @($p | Where-Object { $_.DisplayName -match $suspect })
+    foreach ($x in $hits) {
+        Add-Finding -Id "SW-$($x.DisplayName)" -Area 'Software' -Status 'WARN' `
+            -Detail "suspect software: $($x.DisplayName) ($($x.DisplayVersion))" `
+            -Hint 'Check README; uninstall if unauthorized.'
+        if (-not ($script:Para -or $script:Dry)) {
+            $uStr = "$($x.QuietUninstallString)"
+            if (-not $uStr) { $uStr = "$($x.UninstallString)" }
+            if ($uStr -and -not $Force) {
+                $ans = Read-Host "  uninstall '$($x.DisplayName)'? (y/N)"
+                if ($ans -match '^[Yy]') {
+                    Invoke-CP "uninstall '$($x.DisplayName)'" {
+                        if ($uStr -match 'msiexec(\.exe)?\s+.*[/{]([0-9A-Fa-f-]+)[}]?') {
+                            $guid = $Matches[2]
+                            Start-Process msiexec.exe -ArgumentList "/x {$guid} /qn /norestart" -Wait -NoNewWindow
+                        } elseif ($uStr -match '^"([^"]+)"\s*(.*)$') {
+                            $exe = $Matches[1]; $arg = $Matches[2]
+                            Start-Process -FilePath $exe -ArgumentList $arg -Wait -NoNewWindow
+                        } else {
+                            Start-Process cmd.exe -ArgumentList "/c $uStr" -Wait -NoNewWindow
+                        }
+                        Register-Change -What "Software:$($x.DisplayName)" -Old "$($x.DisplayVersion)" -New 'uninstall invoked'
+                    } | Out-Null
+                }
+            }
+        }
+    }
+
+    # Store / Appx bloatware & games
+    try {
+        $appx = @(Get-AppxPackage -AllUsers -ErrorAction Stop | Where-Object {
+            $_.Name -match '(?i)candycrush|solitaire|xboxgaming|wildtangent|minecraft|roblox|disney|tiktok|spotify|torrent'
+        })
+        foreach ($ax in $appx) {
+            Add-Finding -Id "SW-APPX-$($ax.Name)" -Area 'Software' -Status 'WARN' -Detail "Store app: $($ax.Name) ($($ax.Version))"
+            if (-not ($script:Para -or $script:Dry -or $Force)) {
+                $ans = Read-Host "  remove Store app '$($ax.Name)' for all users? (y/N)"
+                if ($ans -match '^[Yy]') {
+                    Invoke-CP "remove Appx '$($ax.Name)'" {
+                        Remove-AppxPackage -Package $ax.PackageFullName -AllUsers -ErrorAction SilentlyContinue
+                        Register-Change -What "Appx:$($ax.Name)" -Old $ax.Version -New 'removed'
+                    } | Out-Null
+                }
+            }
+        }
+    } catch {}
+
+    # winget outdated third-party app updates (e.g. Notepad++, browsers, 7-Zip)
+    if (Get-Command winget.exe -ErrorAction SilentlyContinue) {
+        Write-CP 'checking winget available upgrades...' 'step'
+        try {
+            $wgOut = & winget.exe upgrade --accept-source-agreements 2>&1
+            $wgOut | Set-Content (Join-Path $script:EvDir '72-winget-upgrade.txt')
+            $wgOut | Select-Object -First 40 | ForEach-Object { Write-Host ("   " + $_) }
+            if (-not ($script:Para -or $script:Dry -or $Force)) {
+                $uAns = Read-Host '  run winget upgrade --all for outdated apps? (y/N)'
+                if ($uAns -match '^[Yy]') {
+                    Invoke-CP 'winget upgrade --all' {
+                        & winget.exe upgrade --all --accept-source-agreements --accept-package-agreements --silent
+                    } | Out-Null
+                }
+            }
+        } catch {}
+    } else {
+        Add-Finding -Id 'SW-WINGET' -Area 'Software' -Status 'INFO' -Detail 'winget not installed -- update Notepad++/browsers/7-Zip manually'
+    }
+}
+
+# ------------------------------------------------------------------------------
+# file inventory (media / password files / user executables / archives). NOTHING deleted.
 # ------------------------------------------------------------------------------
 function Invoke-Files {
     Write-Banner 'FILE INVENTORY (no deletes)'
 
-    $media = '*.mp3','*.mp4','*.m4a','*.avi','*.mkv','*.mov','*.wmv','*.flac','*.wav','*.ogg','*.torrent','*.pcap'
-    $rows = @()
+    $mediaRx = '(?i)\.(mp3|mp4|m4a|avi|mkv|mov|wmv|flac|wav|ogg|aac|wma|webm|torrent|pcap|pcapng)$'
+    $exeRx   = '(?i)\.(exe|msi|bat|cmd|ps1|vbs|scr|js|jar)$'
+    $archRx  = '(?i)(\.(zip|rar|7z|tar\.gz|tgz)|(?:^|[\\/._-])(nc|nc64|ncat|netcat|pyrdp|windirstat|wildtangent|wireshark|nmap|mimikatz|xprobe|doona)(?:[\\/._-]|$))'
+    $docRx   = '(?i)\.(txt|csv|xlsx|docx|rtf|md)$'
+    $credRx  = '(?i)pass|cred|secret|hack|crack|keylog|login'
+
+    $rows = New-Object System.Collections.Generic.List[object]
+    $exe  = New-Object System.Collections.Generic.List[object]
+    $docs = New-Object System.Collections.Generic.List[object]
+    $arch = New-Object System.Collections.Generic.List[object]
+
+    $roots = New-Object System.Collections.Generic.List[string]
     foreach ($p in (Get-ChildItem 'C:\Users' -Directory -ErrorAction SilentlyContinue)) {
-        if ($p.Name -in @('Default','Default User','All Users','Public')) { continue }
-        $rows += @(Get-ChildItem $p.FullName -Recurse -File -Include $media -ErrorAction SilentlyContinue |
-            Where-Object { $_.FullName -notmatch '\\AppData\\' } |
-            Select-Object FullName,Length,LastWriteTime)
+        if ($p.Name -in @('Default','Default User','All Users')) { continue }
+        $roots.Add($p.FullName)
     }
+    foreach ($extra in @('C:\Temp','C:\Downloads')) {
+        if (Test-Path $extra) { $roots.Add($extra) }
+    }
+
+    foreach ($r in $roots) {
+        foreach ($f in (Get-ChildItem $r -Recurse -File -ErrorAction SilentlyContinue)) {
+            $fn = $f.FullName
+            if ($fn -match '(?i)\\AppData\\') { continue }
+            if ($f.Name -match $mediaRx) {
+                $rows.Add([pscustomobject]@{ FullName=$fn; Length=$f.Length; LastWriteTime=$f.LastWriteTime })
+            }
+            if ($f.Name -match $exeRx -and $fn -match '(?i)\\(Desktop|Downloads|Documents|Public|Temp)\\') {
+                $exe.Add([pscustomobject]@{ FullName=$fn; Length=$f.Length; LastWriteTime=$f.LastWriteTime })
+            }
+            if ($f.Name -match $docRx -and $f.Name -match $credRx) {
+                $docs.Add([pscustomobject]@{ FullName=$fn; Length=$f.Length })
+            }
+            if ($f.Name -match $archRx) {
+                $arch.Add([pscustomobject]@{ FullName=$fn; Length=$f.Length; LastWriteTime=$f.LastWriteTime })
+            }
+        }
+    }
+
     $rows | Export-Csv (Join-Path $script:EvDir 'media-files.csv') -NoTypeInformation
     if ($rows.Count -gt 0) {
         Add-Finding -Id 'FILES-MEDIA' -Area 'Files' -Status 'WARN' -Detail "$($rows.Count) media/prohibited-type file(s) inventoried" `
@@ -2210,35 +2848,28 @@ function Invoke-Files {
         Add-Finding -Id 'FILES-MEDIA' -Area 'Files' -Status 'PASS' -Detail 'no media files in user profiles'
     }
 
-    $exe = @()
-    foreach ($p in (Get-ChildItem 'C:\Users' -Directory -ErrorAction SilentlyContinue)) {
-        foreach ($sub in @('Desktop','Downloads','Documents')) {
-            $d = Join-Path $p.FullName $sub
-            if (-not (Test-Path $d)) { continue }
-            $exe += @(Get-ChildItem $d -Recurse -File -Include *.exe,*.msi,*.bat,*.cmd,*.ps1,*.vbs,*.scr -ErrorAction SilentlyContinue |
-                Select-Object FullName,Length,LastWriteTime)
-        }
-    }
     $exe | Export-Csv (Join-Path $script:EvDir 'user-executables.csv') -NoTypeInformation
     if ($exe.Count -gt 0) {
-        Add-Finding -Id 'FILES-EXE' -Area 'Files' -Status 'WARN' -Detail "$($exe.Count) executable(s)/script(s) in user folders" `
+        Add-Finding -Id 'FILES-EXE' -Area 'Files' -Status 'WARN' -Detail "$($exe.Count) executable(s)/script(s) in user/public/temp folders" `
             -Hint 'Check each against the README and the forensic questions before deleting. Unexplained exes are usually malware.'
     } else {
         Add-Finding -Id 'FILES-EXE' -Area 'Files' -Status 'PASS' -Detail 'no executables in user folders'
     }
 
-    $docs = @()
-    foreach ($p in (Get-ChildItem 'C:\Users' -Directory -ErrorAction SilentlyContinue)) {
-        $docs += @(Get-ChildItem $p.FullName -Recurse -File -Include *.txt,*.csv,*.xlsx,*.docx -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -match '(?i)pass|cred|secret|hack|crack|keylog|login' -and $_.FullName -notmatch '\\AppData\\' } |
-            Select-Object FullName,Length)
-    }
     $docs | Export-Csv (Join-Path $script:EvDir 'suspect-documents.csv') -NoTypeInformation
     if ($docs.Count -gt 0) {
         Add-Finding -Id 'FILES-DOCS' -Area 'Files' -Status 'WARN' -Detail "$($docs.Count) password/credential-named document(s)" `
             -Hint 'Password lists are usually a scored policy violation. Record the path in the report; deleting business data loses points.'
     } else {
         Add-Finding -Id 'FILES-DOCS' -Area 'Files' -Status 'PASS' -Detail 'no password-named documents in user profiles'
+    }
+
+    $arch | Export-Csv (Join-Path $script:EvDir 'prohibited-archives-tools.csv') -NoTypeInformation
+    if ($arch.Count -gt 0) {
+        Add-Finding -Id 'FILES-ARCHIVES' -Area 'Files' -Status 'WARN' -Detail "$($arch.Count) archive/tool drop(s) (zip/7z/nc/pyrdp/wireshark/etc.)" `
+            -Hint 'Review prohibited-archives-tools.csv -- CyberPatriot images hide prohibited software archives (e.g. pyrdp, nc, netcat) in Downloads/Public/Temp.'
+    } else {
+        Add-Finding -Id 'FILES-ARCHIVES' -Area 'Files' -Status 'PASS' -Detail 'no prohibited archives or tool drops found'
     }
     Write-CP "full inventory -> $script:EvDir" 'ok'
 }
@@ -2306,8 +2937,17 @@ function Invoke-Verify {
         @{p='HKLM:\SYSTEM\CurrentControlSet\Control\Lsa'; n='NoLMHash'; want='1'; id='VER-NoLMHash'},
         @{p='HKLM:\SYSTEM\CurrentControlSet\Control\Lsa'; n='LMCompatibilityLevel'; want='5'; id='VER-LMCompat'},
         @{p='HKLM:\SYSTEM\CurrentControlSet\Control\Lsa'; n='LimitBlankPasswordUse'; want='1'; id='VER-BlankPw'},
+        @{p='HKLM:\SYSTEM\CurrentControlSet\Control\Lsa'; n='DisableDomainCreds'; want='1'; id='VER-DisableDomainCreds'},
+        @{p='HKLM:\SYSTEM\CurrentControlSet\Control\Lsa'; n='SCENoApplyLegacyAuditPolicy'; want='1'; id='VER-NoLegacyAudit'},
         @{p='HKLM:\SYSTEM\CurrentControlSet\Control\Lsa'; n='RunAsPPL'; want='1'; id='VER-RunAsPPL'},
         @{p='HKLM:\SYSTEM\CurrentControlSet\Control\Lsa\WDigest'; n='UseLogonCredential'; want='0'; id='VER-WDigest'},
+        @{p='HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\WDigest'; n='UseLogonCredential'; want='0'; id='VER-WDigestReal'},
+        @{p='HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System'; n='DontDisplayLastUserName'; want='1'; id='VER-LastUser'},
+        @{p='HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\CredUI'; n='EnumerateAdministrators'; want='0'; id='VER-EnumAdmins'},
+        @{p='HKLM:\SOFTWARE\Policies\Microsoft\Windows\System'; n='EnableSmartScreen'; want='1'; id='VER-SmartScreen'},
+        @{p='HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer'; n='SmartScreenEnabled'; want='RequireAdmin'; id='VER-SmartScreenExp'},
+        @{p='HKLM:\SYSTEM\CurrentControlSet\Control\Remote Assistance'; n='fAllowToGetHelp'; want='0'; id='VER-RemoteAssist'},
+        @{p='HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU'; n='NoAutoUpdate'; want='0'; id='VER-WUAuto'},
         @{p='HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters'; n='RequireSecuritySignature'; want='1'; id='VER-SMBSign'},
         @{p='HKLM:\SYSTEM\CurrentControlSet\Services\LanmanWorkstation\Parameters'; n='RequireSecuritySignature'; want='1'; id='VER-SMBSignC'},
         @{p='HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters'; n='DisableIPSourceRouting'; want='2'; id='VER-IPSrcRoute'},
@@ -2327,6 +2967,49 @@ function Invoke-Verify {
             $good = ("$v" -eq $r.want)
             Add-Finding -Id $r.id -Area 'Verify' -Status $(if ($good) {'PASS'} else {'FAIL'}) -Detail "$($r.n) = $v (want $($r.want))"
         }
+    }
+
+    # ---- live auditpol subcategories ---------------------------------------
+    foreach ($sub in @('Credential Validation','Logon','Account Lockout','User Account Management','Process Creation','Audit Policy Change')) {
+        $ao = (& auditpol /get /subcategory:"$sub" 2>&1) -join ' '
+        $hasBoth = ($ao -match 'Success and Failure')
+        Add-Finding -Id ("VER-AUD-" + ($sub -replace '\s+','')) -Area 'Verify' -Status $(if ($hasBoth) {'PASS'} else {'WARN'}) `
+            -Detail "auditpol [$sub]: $(if ($hasBoth) {'Success and Failure'} else {'not Success and Failure'})"
+    }
+
+    # ---- custom/hidden SMB shares & User Rights ----------------------------
+    try {
+        $badShares = @(Get-SmbShare -ErrorAction Stop | Where-Object {
+            $_.Name -notmatch '^(ADMIN\$|IPC\$|print\$|SYSVOL|NETLOGON|[A-Z]\$)$'
+        })
+        Add-Finding -Id 'VER-SHARES-CUSTOM' -Area 'Verify' -Status $(if ($badShares.Count -eq 0) {'PASS'} else {'FAIL'}) `
+            -Detail "$(if ($badShares.Count -eq 0) {'no custom/hidden SMB shares'} else {"custom/hidden shares remain: $(($badShares | ForEach-Object {$_.Name}) -join ', ')"})"
+    } catch {}
+
+    try {
+        $urList = Get-CPUserRights
+        $admNames = @(Get-AdminMemberNames)
+        $badU = New-Object System.Collections.Generic.List[string]
+        foreach ($ur in $urList) {
+            if ($ur.Right -notin @('SeSecurityPrivilege','SeTakeOwnershipPrivilege','SeDebugPrivilege','SeTcbPrivilege','SeBackupPrivilege','SeRestorePrivilege','SeLoadDriverPrivilege','SeManageVolumePrivilege','SeRemoteShutdownPrivilege','SeCreateTokenPrivilege','SeRelabelPrivilege','SeTrustedCredManAccessPrivilege','SeEnableDelegationPrivilege')) { continue }
+            foreach ($nm in $ur.Names) {
+                $short = ($nm -split '\\')[-1]
+                if ($short -match '^(Administrators|SYSTEM)$') { continue }
+                if ($short -match '^(Everyone|Anonymous Logon|ANONYMOUS LOGON|Guest|Guests|Users|Authenticated Users)$' -or ($admNames -notcontains $short)) {
+                    $badU.Add("$($ur.Right)=$nm")
+                }
+            }
+        }
+        Add-Finding -Id 'VER-URIGHTS' -Area 'Verify' -Status $(if ($badU.Count -eq 0) {'PASS'} else {'FAIL'}) `
+            -Detail "$(if ($badU.Count -eq 0) {'sensitive User Rights Assignments clean'} else {"unauthorized privileges: $($badU -join '; ')"})"
+    } catch {}
+
+    # ---- optional features -------------------------------------------------
+    foreach ($fn in @('SimpleTCP','TelnetClient','TFTP','SMB1Protocol')) {
+        try {
+            $feat = Get-WindowsOptionalFeature -Online -FeatureName $fn -ErrorAction Stop
+            Add-Finding -Id "VER-FEAT-$fn" -Area 'Verify' -Status $(if ($feat.State -ne 'Enabled') {'PASS'} else {'FAIL'}) -Detail "$fn = $($feat.State)"
+        } catch {}
     }
 
     # autologon: an absent key is also a PASS
@@ -2608,43 +3291,45 @@ function Show-Menu {
     while ($true) {
         Write-Banner ("cbptwindows $script:Version  --  $script:Hostname")
         $tags = ''
-        if ($Aggressive) { $tags += ' [AGGRESSIVE]' }
-        if ($Paranoid)   { $tags += ' [PARANOID]' }
-        if ($script:Dry) { $tags += ' [DRY RUN]' }
+        if ($script:Agg)  { $tags += ' [AGGRESSIVE]' }
+        if ($script:Para) { $tags += ' [PARANOID]' }
+        if ($script:Dry)  { $tags += ' [DRY RUN]' }
         if ($tags) { Write-Host ("   mode:{0}" -f $tags) -ForegroundColor Yellow }
         Write-Host ''
         Write-Host '   r) recon + evidence dump      (read only, safe)'  -ForegroundColor White
         Write-Host '   b) backup only'                                    -ForegroundColor White
-        Write-Host '   1) users + local security policy (users.txt/admins.txt + secedit)' -ForegroundColor White
-        Write-Host '   2) registry hardening (LSA/UAC/SMB/TLS/PS logging)' -ForegroundColor White
-        Write-Host '   3) network / firewall / SMB'                       -ForegroundColor White
+        Write-Host '   1) users + local security policy (users.txt/admins.txt/groups.txt + secedit)' -ForegroundColor White
+        Write-Host '   2) registry hardening (LSA/UAC/SMB/TLS/SmartScreen/WU/PS logging)' -ForegroundColor White
+        Write-Host '   3) network / firewall / SMB / optional features'   -ForegroundColor White
         Write-Host '   4) services'                                       -ForegroundColor White
         Write-Host '   5) defender + audit + updates'                     -ForegroundColor White
-        Write-Host '   6) installed apps (IIS/Apache/MySQL)'              -ForegroundColor White
-        Write-Host '   7) file inventory (media/PII/exes, no deletes)'    -ForegroundColor White
+        Write-Host '   6) installed apps (IIS/Apache/MySQL/OpenSSH)'      -ForegroundColor White
+        Write-Host '   7) file inventory (media/PII/exes/archives, no deletes)' -ForegroundColor White
+        Write-Host '   8) software audit / updates / uninstall helper'    -ForegroundColor White
         Write-Host '   v) verify + scorecard'                              -ForegroundColor White
         Write-Host '   a) RUN ALL (backup -> recon -> harden -> verify)'  -ForegroundColor Green
         Write-Host '   h) hints: how to max the score'                     -ForegroundColor Cyan
-        Write-Host ("   x) toggle -Aggressive   (currently: {0})" -f [bool]$Aggressive) -ForegroundColor $(if($Aggressive){'Yellow'}else{'White'})
-        Write-Host ("   p) toggle -Paranoid     (currently: {0})" -f [bool]$Paranoid)   -ForegroundColor $(if($Paranoid){'Yellow'}else{'White'})
-        Write-Host ("   d) toggle -DryRun        (currently: {0})" -f $script:Dry)      -ForegroundColor $(if($script:Dry){'Yellow'}else{'White'})
+        Write-Host ("   x) toggle -Aggressive   (currently: {0})" -f $script:Agg)  -ForegroundColor $(if($script:Agg){'Yellow'}else{'White'})
+        Write-Host ("   p) toggle -Paranoid     (currently: {0})" -f $script:Para) -ForegroundColor $(if($script:Para){'Yellow'}else{'White'})
+        Write-Host ("   d) toggle -DryRun       (currently: {0})" -f $script:Dry)  -ForegroundColor $(if($script:Dry){'Yellow'}else{'White'})
         Write-Host '   q) quit'                                               -ForegroundColor DarkGray
         Write-Host ''
         $c = ''
         try { $c = (Read-Host '  pick one').Trim().ToLower() } catch { return }
         switch -Regex ($c) {
             '^r' { Invoke-Recon;       Export-Report }
-            '^b' { New-CPBackup }
+            '^b' { New-CPBackup -ForceBackup }
             '^1' { Invoke-Users;       Export-Report }
-            '^2' { if (-not ($Paranoid -or $NoBackup -or $script:Dry)) { New-CPBackup }; Invoke-Registry;    Export-Report }
-            '^3' { if (-not ($Paranoid -or $NoBackup -or $script:Dry)) { New-CPBackup }; Invoke-Network;     Export-Report }
-            '^4' { if (-not ($Paranoid -or $NoBackup -or $script:Dry)) { New-CPBackup }; Invoke-Services;    Export-Report }
-            '^5' { if (-not ($Paranoid -or $NoBackup -or $script:Dry)) { New-CPBackup }; Invoke-Defender;    Export-Report }
-            '^6' { if (-not ($Paranoid -or $NoBackup -or $script:Dry)) { New-CPBackup }; Invoke-Apps;        Export-Report }
-            '^7' { if (-not ($Paranoid -or $NoBackup -or $script:Dry)) { New-CPBackup }; Invoke-Files;       Export-Report }
+            '^2' { if (-not ($script:Para -or $NoBackup -or $script:Dry)) { New-CPBackup }; Invoke-Registry;    Export-Report }
+            '^3' { if (-not ($script:Para -or $NoBackup -or $script:Dry)) { New-CPBackup }; Invoke-Network;     Export-Report }
+            '^4' { if (-not ($script:Para -or $NoBackup -or $script:Dry)) { New-CPBackup }; Invoke-Services;    Export-Report }
+            '^5' { if (-not ($script:Para -or $NoBackup -or $script:Dry)) { New-CPBackup }; Invoke-Defender;    Export-Report }
+            '^6' { if (-not ($script:Para -or $NoBackup -or $script:Dry)) { New-CPBackup }; Invoke-Apps;        Export-Report }
+            '^7' { if (-not ($script:Para -or $NoBackup -or $script:Dry)) { New-CPBackup }; Invoke-Files;       Export-Report }
+            '^8' { if (-not ($script:Para -or $NoBackup -or $script:Dry)) { New-CPBackup }; Invoke-Software;    Export-Report }
             '^v' { Invoke-Verify;      Export-Report }
             '^a' {
-                if (Confirm-CP 'Run the full safe pass now? (backup, recon, users, registry, network, services, defender, apps, files, verify)') {
+                if (Confirm-CP 'Run the full safe pass now? (backup, recon, users, registry, network, services, defender, apps, software, files, verify)') {
                     New-CPBackup
                     Invoke-Recon
                     Invoke-Users
@@ -2653,15 +3338,16 @@ function Show-Menu {
                     Invoke-Services
                     Invoke-Defender
                     Invoke-Apps
+                    Invoke-Software
                     Invoke-Files
                     Invoke-Verify
                     Export-Report
                 }
             }
             '^h' { Show-Hints }
-            '^x' { $script:Aggressive = -not $script:Aggressive }
-            '^p' { $script:Paranoid   = -not $script:Paranoid }
-            '^d' { $script:Dry        = -not $script:Dry }
+            '^x' { $script:Agg  = -not $script:Agg }
+            '^p' { $script:Para = -not $script:Para }
+            '^d' { $script:Dry  = -not $script:Dry }
             '^q' { Write-CP 'bye. good luck on the round.' 'info'; return }
             default { Write-CP 'huh?' 'warn' }
         }
@@ -2682,8 +3368,8 @@ function Main {
 
     Write-Banner ("cbptwindows $script:Version   |   $script:Hostname   |   " + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))
     $tier = 'DEFAULT (safe)'
-    if ($Paranoid)   { $tier = 'PARANOID (read only)' }
-    elseif ($Aggressive) { $tier = 'AGGRESSIVE' }
+    if ($script:Para)    { $tier = 'PARANOID (read only)' }
+    elseif ($script:Agg) { $tier = 'AGGRESSIVE' }
     Write-CP ("tier: {0}{1}" -f $tier, $(if ($Force) { ' [non-interactive]' } else { '' })) 'head'
     if ($script:Dry) { Write-CP 'dry-run: nothing on the system will change' 'warn' }
 
@@ -2708,26 +3394,27 @@ function Main {
 
     # single-section runs change policy/registry/firewall/services too; take a
     # backup first unless the operator explicitly asked for none.
-    $backupPhases = @('registry','network','services','defender','apps','files')
-    if (($backupPhases -contains $Phase) -and -not ($Paranoid -or $NoBackup -or $script:Dry)) {
+    $backupPhases = @('registry','network','services','defender','apps','software','files')
+    if (($backupPhases -contains $Phase) -and -not ($script:Para -or $NoBackup -or $script:Dry)) {
         New-CPBackup
     }
 
     switch ($Phase) {
         'menu'     { Show-Menu }
-        'recon'    { if (-not ($Paranoid -or $NoBackup)) { New-CPBackup }; Invoke-Recon; Export-Report }
-        'users'    { if (-not ($Paranoid -or $NoBackup)) { New-CPBackup }; Invoke-Users; Export-Report }
+        'recon'    { if (-not ($script:Para -or $NoBackup -or $script:Dry)) { New-CPBackup }; Invoke-Recon; Export-Report }
+        'users'    { if (-not ($script:Para -or $NoBackup -or $script:Dry)) { New-CPBackup }; Invoke-Users; Export-Report }
         'registry' { Invoke-Registry; Export-Report }
         'network'  { Invoke-Network; Export-Report }
         'services' { Invoke-Services; Export-Report }
         'defender' { Invoke-Defender; Export-Report }
         'apps'     { Invoke-Apps; Export-Report }
+        'software' { Invoke-Software; Export-Report }
         'files'    { Invoke-Files; Export-Report }
         'verify'   { Invoke-Verify; Export-Report }
         'report'   { Export-Report }
         'guide'    { Show-Hints }
         'all'      {
-            if (-not ($Paranoid -or $NoBackup)) { New-CPBackup }
+            if (-not ($script:Para -or $NoBackup -or $script:Dry)) { New-CPBackup }
             Invoke-Recon
             Invoke-Users
             Invoke-Registry
@@ -2735,6 +3422,7 @@ function Main {
             Invoke-Services
             Invoke-Defender
             Invoke-Apps
+            Invoke-Software
             Invoke-Files
             Invoke-Verify
             Export-Report

@@ -66,8 +66,8 @@
 #   modules: recon users passwords ssh firewall services packages sysctl
 #            perms audit apps verify report
 #
-#   the users module reconciles accounts against users.txt and admins.txt
-#   next to this script (one name per line, copied from the README).
+#   the users module reconciles accounts against users.txt, admins.txt, and
+#   groups.txt next to this script (one name per line, copied from the README).
 #   templates are created on first run if they are missing.
 #
 #  ------------------------------------------------------------------------------
@@ -82,6 +82,15 @@
 #   1.1.0  merged the best of our other helpers: users.txt/admins.txt
 #          reconciliation, --dry-run, prohibited-media hunt, needs-review.txt,
 #          the master hints guide.
+#   1.2.0  added groups.txt reconciliation, GID/nopasswdlogin/shell/sudoers-README
+#          escalation checks, single-pass filesystem find + fast pre-filtered
+#          PII scan + cached package inventory, archive/tool/debsums/browser/
+#          nonpackaged-proc hunts, pam_pwhistory + nullok_secure + inline PAM
+#          options, 10periodic + 50unattended-upgrades + apt security check,
+#          OpenSSH 00-cbptlinux.conf + direct sshd_config sync + rollback fix,
+#          99-zzz-cyberpatriot.conf sysctl override protection + host.conf,
+#          vsftpd guest_enable prompt, ctrl-alt-del mask, AppArmor enforcement,
+#          and expanded verify coverage.
 #
 #  TODO / known gaps:
 #   - SELinux relabel after perm changes is best-effort only
@@ -95,7 +104,7 @@
 set -o pipefail
 umask 022
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 EVID="${CP_EVID_DIR:-/root/cbptlinux-evidence}"
 BKROOT="${CP_BACKUP_ROOT:-/root/cbptlinux-backup}"
@@ -547,6 +556,44 @@ do_recon() {
     finding "USER-NOPASS" "Accounts" "PASS" "no empty password fields"
   fi
 
+  # root blank password specifically
+  if awk -F: '$1=="root" && $2=="" {found=1} END{exit !found}' /etc/shadow 2>/dev/null; then
+    finding "USER-ROOT-BLANK" "Accounts" "FAIL" "root has a BLANK password" \
+      "Set a strong root password (passwd root) or lock root (passwd -l root)."
+  fi
+
+  # extra GID 0 or primary GID matching sudo/wheel/admin (bypasses /etc/group membership!)
+  local priv_gids="" gn gidv gid_hits=""
+  for gn in root sudo wheel admin; do
+    gidv="$(getent group "$gn" 2>/dev/null | cut -d: -f3)"
+    [[ "$gidv" =~ ^[0-9]+$ ]] && priv_gids="${priv_gids:+$priv_gids|}$gidv"
+  done
+  if [[ -n "$priv_gids" ]]; then
+    gid_hits="$(awk -F: -v rx="^($priv_gids)$" '$1!="root" && ($4==0 || $4 ~ rx) {print $1"(gid="$4")"}' /etc/passwd 2>/dev/null | tr '\n' ' ')"
+    if [[ -n "$gid_hits" ]]; then
+      finding "USER-GID-PRIV" "Accounts" "FAIL" "non-root account(s) with privileged primary GID: $gid_hits" \
+        "Setting primary GID to 0 or sudo/wheel GID grants hidden privilege without appearing in /etc/group. usermod -g <user_gid> <user>."
+    fi
+  fi
+
+  # nopasswdlogin group (passwordless GUI login)
+  local npw
+  npw="$(getent group nopasswdlogin 2>/dev/null | cut -d: -f4)"
+  if [[ -n "$npw" ]]; then
+    finding "GRP-NOPASSWDLOGIN" "Accounts" "FAIL" "nopasswdlogin group has members: $npw" \
+      "gpasswd -d <user> nopasswdlogin -- members can log into the desktop without a password."
+  fi
+
+  # non-standard / trojaned shells not in /etc/shells
+  local badsh=""
+  if [[ -r /etc/shells ]]; then
+    badsh="$(awk -F: 'NR==FNR{if($0 ~ /^\//) valid[$0]=1; next}
+      $7 != "" && $7 !~ /(nologin|false|sync|shutdown|halt)$/ && !($7 in valid) {print $1"("$7")"}' \
+      /etc/shells /etc/passwd 2>/dev/null | tr '\n' ' ')"
+    [[ -n "$badsh" ]] && finding "USER-BADSHELL" "Accounts" "FAIL" "account(s) with non-standard shell not in /etc/shells: $badsh" \
+      "Check if the shell is a trojaned script or backdoor binary. Fix with usermod -s /bin/bash or /usr/sbin/nologin."
+  fi
+
   # UID < 1000 with a login shell
   local sysusers
   sysusers="$(awk -F: '$3<1000 && $3!=0 && $7!~/(nologin|false|sync|shutdown|halt)/ {print $1"("$3","$7")"}' /etc/passwd | tr '\n' ' ')"
@@ -570,15 +617,22 @@ do_recon() {
   # who can sudo
   { echo "### /etc/sudoers"; cat /etc/sudoers 2>/dev/null
     echo; echo "### /etc/sudoers.d/*"; for f in /etc/sudoers.d/*; do [[ -f "$f" ]] && { echo "-- $f"; cat "$f"; }; done
-    echo; echo "### groups"; getent group sudo wheel admin root 2>/dev/null
+    echo; echo "### groups"; getent group sudo wheel admin root nopasswdlogin 2>/dev/null
   } >"$EVID/11-sudo.txt"
-  if grep -REn '^[^#]*(NOPASSWD|ALL\s*=\s*\(ALL(:ALL)?\)\s*ALL|%\w+\s+ALL)' /etc/sudoers /etc/sudoers.d/ 2>/dev/null >/dev/null; then
+  if grep -REn '^[^#]*(NOPASSWD|!authenticate|ALL\s*=\s*\(ALL(:ALL)?\)\s*ALL|%\w+\s+ALL)' /etc/sudoers /etc/sudoers.d/ 2>/dev/null >/dev/null; then
     finding "SUDO-RULES" "Accounts" "WARN" "broad sudo rule(s) present, see $EVID/11-sudo.txt" \
-      "NOPASSWD and 'ALL=(ALL) ALL' for a whole group are usually scored. Trim to the specific commands the user needs."
+      "NOPASSWD, !authenticate, and 'ALL=(ALL) ALL' for a whole group are usually scored. Trim to the specific commands the user needs."
   fi
-  if grep -REq '^[^#]*\sALL\s*=\s*\(ALL(:ALL)?\)\s*NOPASSWD:\s*ALL' /etc/sudoers /etc/sudoers.d/ 2>/dev/null; then
-    finding "SUDO-NOPASSWD" "Accounts" "FAIL" "someone has NOPASSWD:ALL" \
-      "Passwordless full root is a serious finding. Remove unless the README justifies it."
+  if grep -REq '^[^#]*(\sALL\s*=\s*\(ALL(:ALL)?\)\s*NOPASSWD:\s*ALL|!authenticate)' /etc/sudoers /etc/sudoers.d/ 2>/dev/null; then
+    finding "SUDO-NOPASSWD" "Accounts" "FAIL" "someone has NOPASSWD:ALL or !authenticate in sudoers" \
+      "Passwordless full root or !authenticate is a serious finding. Remove unless the README justifies it."
+  fi
+  if [[ -f /etc/sudoers.d/README ]] && grep -Evq '^[[:space:]]*(#|$)' /etc/sudoers.d/README 2>/dev/null; then
+    finding "SUDO-TRAPS" "Accounts" "FAIL" "/etc/sudoers.d/README contains active non-comment rule(s)" \
+      "Classic CyberPatriot hiding spot for 'ALL ALL=NOPASSWD:ALL'. Inspect and clean /etc/sudoers.d/README."
+  elif grep -REq '^[^#]*timestamp_timeout[[:space:]]*=[[:space:]]*(-1|[2-9][0-9]|[0-9]{3,})' /etc/sudoers /etc/sudoers.d/ 2>/dev/null; then
+    finding "SUDO-TRAPS" "Accounts" "FAIL" "sudo timestamp_timeout is disabled (-1) or excessively long" \
+      "Remove timestamp_timeout=-1 or set Defaults timestamp_timeout=5."
   fi
   # world-writable sudoers is game over
   local ww
@@ -650,16 +704,28 @@ do_recon() {
       23)     finding "PORT-23" "Network" "FAIL" "TELNET listening ($proc)" "Telnet is essentially never legitimate. Stop+disable it and purge telnetd." ;;
       25|587) finding "PORT-25" "Network" "INFO" "SMTP listening ($proc)" "If it is a critical service, disable open relay + VRFY and require auth." ;;
       69)     finding "PORT-69" "Network" "WARN" "TFTP listening ($proc)" "Unauthenticated file transfer; usually a scored vuln." ;;
+      110|995) finding "PORT-$port" "Network" "FAIL" "POP3 listening ($proc)" "POP3 service (dovecot/qpopper) is frequently scored. Stop+disable+purge unless README requires mail." ;;
+      143|993) finding "PORT-$port" "Network" "WARN" "IMAP listening ($proc)" "Stop+disable unless README requires mail." ;;
       111)    finding "PORT-111" "Network" "WARN" "rpcbind listening ($proc)" "Disable rpcbind unless NFS is required." ;;
       161)    finding "PORT-161" "Network" "WARN" "SNMP listening ($proc)" "Change community off public/private, restrict sources, prefer SNMPv3." ;;
       445|139) finding "PORT-445" "Network" "INFO" "SMB listening ($proc)" "Samba is often a critical service. Harden smb.conf rather than killing it." ;;
+      2049)   finding "PORT-2049" "Network" "WARN" "NFS listening ($proc)" "Disable nfs-kernel-server unless required by README." ;;
+      3128)   finding "PORT-3128" "Network" "FAIL" "Squid proxy listening ($proc)" "Proxy server is frequently a scored unauthorized service. Stop+disable+purge unless README requires it." ;;
       3306)   finding "PORT-3306" "Network" "WARN" "MySQL listening ($proc)" "bind-address=127.0.0.1 unless remote DB access is required." ;;
       5432)   finding "PORT-5432" "Network" "WARN" "Postgres listening ($proc)" "listen_addresses='localhost' unless required; check pg_hba.conf for trust." ;;
       5900|5901) finding "PORT-5900" "Network" "FAIL" "VNC listening ($proc)" "VNC on a CP image is usually a backdoor. Investigate." ;;
+      6379)   finding "PORT-6379" "Network" "WARN" "Redis listening ($proc)" "Bind to 127.0.0.1 and requirepass, or stop+disable if unused." ;;
       6667|6668|6669) finding "PORT-6667" "Network" "FAIL" "IRC listening ($proc)" "IRC daemon = botnet C2 until proven otherwise." ;;
-      31337|4444|5555|12345) finding "PORT-$port" "Network" "FAIL" "suspicious high port $port listening ($proc)" "Textbook backdoor port. Find the binary, hash it, note it, kill it." ;;
+      27017)  finding "PORT-27017" "Network" "WARN" "MongoDB listening ($proc)" "Bind to 127.0.0.1 and enable auth, or stop+disable if unused." ;;
+      1337|4444|5555|9001|9050|12345|31337) finding "PORT-$port" "Network" "FAIL" "suspicious high port $port listening ($proc)" "Textbook backdoor/Tor port. Find the binary, hash it, note it, kill it." ;;
     esac
   done < <(sort -t$'\t' -k3,3n -u "$EVID/20-listening.tsv" 2>/dev/null)
+
+  # /etc/host.conf nospoof check
+  if [[ -f /etc/host.conf ]] && ! grep -Eq '^[[:space:]]*nospoof[[:space:]]+on' /etc/host.conf 2>/dev/null; then
+    finding "NET-HOSTCONF" "Network" "WARN" "/etc/host.conf missing 'nospoof on'" \
+      "Add 'nospoof on' to /etc/host.conf (sysctl module handles this too)."
+  fi
 
   # promisc mode / sniffing
   if ip link 2>/dev/null | grep -qi 'PROMISC'; then
@@ -674,18 +740,34 @@ do_recon() {
   fi
 # ---- persistence ------------------------------------------------------------
   step "persistence"
-  { echo "### /etc/rc.local"; cat /etc/rc.local 2>/dev/null
+  { echo "### /etc/environment"; cat /etc/environment 2>/dev/null
+    echo; echo "### /etc/rc.local"; cat /etc/rc.local 2>/dev/null
     echo; echo "### /etc/profile.d/"; ls -la /etc/profile.d/ 2>/dev/null
     for f in /etc/profile.d/*; do [[ -f "$f" ]] && { echo "-- $f"; cat "$f"; }; done
     echo; echo "### /etc/profile"; cat /etc/profile 2>/dev/null
     echo; echo "### /etc/bash.bashrc"; cat /etc/bash.bashrc 2>/dev/null
     echo; echo "### per-user rc files"
     for d in /root /home/*; do
-      for f in "$d/.bashrc" "$d/.bash_profile" "$d/.profile" "$d/.bash_login"; do
+      for f in "$d/.bashrc" "$d/.bash_profile" "$d/.profile" "$d/.bash_login" "$d/.bash_aliases"; do
         [[ -f "$f" ]] && { echo "-- $f"; cat "$f"; }
       done
     done
   } >"$EVID/30-shell-startup.txt"
+
+  # /etc/environment PATH hijack
+  if [[ -f /etc/environment ]] && grep -Eq 'PATH=.*(/tmp/|/var/tmp/|/dev/shm/|/home/|:\.:|^\.|:\s*$)' /etc/environment 2>/dev/null; then
+    finding "ENV-PATH" "Persistence" "FAIL" "/etc/environment PATH looks hijacked" \
+      "Inspect /etc/environment and restore standard PATH."
+  fi
+
+  # shell startup tampering (history disable, suspicious aliases, reverse shells)
+  local shhits=""
+  shhits="$(grep -REn '(unset[[:space:]]+HISTFILE|HISTSIZE=0|HISTFILESIZE=0|alias[[:space:]]+(sudo|ls|ps|ss|netstat|su)=|/dev/tcp/|nc[[:space:]]+-[le]|bash[[:space:]]+-i|curl.*\|[[:space:]]*(sh|bash)|wget.*\|[[:space:]]*(sh|bash))' \
+    /etc/profile /etc/profile.d /etc/bash.bashrc /root/.bashrc /root/.profile /home/*/.bashrc /home/*/.profile /home/*/.bash_aliases 2>/dev/null | head -10)"
+  if [[ -n "$shhits" ]]; then
+    finding "SHELL-TAMPER" "Persistence" "FAIL" "suspicious command/alias/HISTFILE tamper in shell startup" \
+      "Check $EVID/30-shell-startup.txt -- remove backdoor lines and re-enable history."
+  fi
 
   # ld.so.preload == rootkit city
   if [[ -s /etc/ld.so.preload ]]; then
@@ -695,20 +777,35 @@ do_recon() {
     finding "ROOTKIT-PRELOAD" "Persistence" "PASS" "/etc/ld.so.preload empty or absent"
   fi
 
-  # cron
+  # cron (including dotfiles like non-empty .placeholder!)
   { echo "### /etc/crontab"; cat /etc/crontab 2>/dev/null
-    echo; echo "### /etc/cron.d/"; for f in /etc/cron.d/*; do [[ -f "$f" ]] && { echo "-- $f"; cat "$f"; }; done
+    echo; echo "### /etc/cron.d/"; for f in /etc/cron.d/* /etc/cron.d/.*; do [[ -f "$f" ]] && { echo "-- $f"; cat "$f"; }; done
     echo; echo "### cron.{hourly,daily,weekly,monthly}"
     ls -la /etc/cron.hourly /etc/cron.daily /etc/cron.weekly /etc/cron.monthly 2>/dev/null
+    for d in /etc/cron.hourly /etc/cron.daily /etc/cron.weekly /etc/cron.monthly; do
+      for f in "$d"/.*; do
+        [[ -f "$f" ]] || continue
+        echo "-- dotfile: $f"
+        cat "$f" 2>/dev/null
+      done
+    done
     echo; echo "### user crontabs"
     for d in /var/spool/cron/crontabs/* /var/spool/cron/*; do [[ -f "$d" ]] && { echo "-- $d"; cat "$d"; }; done 2>/dev/null
     echo; echo "### crontab -l (root)"; crontab -l 2>&1
     echo; echo "### at jobs"; atq 2>&1
   } >"$EVID/31-cron.txt"
-  if grep -REq '(wget|curl|nc |ncat|/dev/tcp/|base64|python -c|perl -e|bash -i)' /etc/cron* /var/spool/cron 2>/dev/null; then
+  if grep -REq '(wget|curl|nc |ncat|/dev/tcp/|base64|python[23]? -c|perl -e|bash -i|ufw disable)' /etc/cron* /var/spool/cron 2>/dev/null; then
     finding "CRON-SUSPECT" "Persistence" "FAIL" "cron entry downloads/executes something" \
       "cat the offending file, screenshot it, then remove the entry. Cron-based downloaders are extremely common on CP images."
   fi
+  local crondot
+  for crondot in /etc/cron.hourly/.* /etc/cron.daily/.* /etc/cron.weekly/.* /etc/cron.monthly/.* /etc/cron.d/.*; do
+    [[ -f "$crondot" ]] || continue
+    if grep -Evq '^[[:space:]]*(#|$)' "$crondot" 2>/dev/null; then
+      finding "CRON-DOT-$(basename "$crondot")" "Persistence" "FAIL" "active code inside hidden cron dotfile: $crondot" \
+        "Hidden cron dotfiles (even .placeholder) are a classic persistence trick. Inspect and clean $crondot."
+    fi
+  done
 
   # systemd units outside the distro default
   : >"$EVID/32-systemd-units.txt"
@@ -724,24 +821,83 @@ do_recon() {
   local u
   for u in /etc/systemd/system/*.service; do
     [[ -f "$u" ]] || continue
-    if grep -Eq 'ExecStart=.*(\/tmp\/|\/dev\/shm\/|\/var\/tmp\/|\/home\/.*\/\.|wget|curl|nc |python -c|bash -c)' "$u" 2>/dev/null; then
+    if grep -Eq 'ExecStart=.*(\/tmp\/|\/dev\/shm\/|\/var\/tmp\/|\/home\/.*\/\.|wget|curl|nc |ncat|socat|python[23]? -c|bash -c|/dev/tcp/)' "$u" 2>/dev/null; then
       finding "UNIT-$(basename "$u")" "Persistence" "FAIL" "$u ExecStart looks malicious" \
         "systemctl cat $(basename "$u") -- then disable + mask it and record the binary path."
     fi
   done
 
-  # processes with odd paths
+  # non-packaged /etc/init.d scripts (catches sysv backdoors)
+  if [[ -d /etc/init.d ]] && command -v dpkg >/dev/null 2>&1; then
+    local initf
+    for initf in /etc/init.d/*; do
+      [[ -f "$initf" ]] || continue
+      case "$(basename "$initf")" in README|rc|rcS|skeleton|.legacy-bootordering) continue ;; esac
+      if ! dpkg -S "$initf" >/dev/null 2>&1; then
+        finding "INIT-$(basename "$initf")" "Persistence" "WARN" "non-packaged init script: $initf" \
+          "Inspect $initf -- custom init scripts are often backdoors."
+      fi
+    done
+  fi
+
+  # processes with odd paths + non-packaged binary check
   ps -eo pid,ppid,user,etimes,cmd --sort=-etimes >"$EVID/33-processes.txt" 2>&1
+  : >"$EVID/35-nonpackaged-procs.txt"
   while read -r pid ppid user et cmd; do
     [[ "$pid" == "PID" ]] && continue
     if [[ "$cmd" =~ ^(/tmp/|/var/tmp/|/dev/shm/|/home/[^/]+/\.) ]]; then
       finding "PROC-$pid" "Persistence" "FAIL" "pid $pid ($user) running from a writable dir: $cmd" \
         "Process running out of /tmp, /dev/shm or a dotdir = malware. ls -l /proc/$pid/exe, sha256sum it, note it, then kill."
     fi
-    if [[ "$cmd" =~ (nc[[:space:]]+-[le]|ncat|socat.*exec|/dev/tcp/|cryptominer|xmrig|minerd|kdevtmpfsi) ]]; then
-      finding "PROC-$pid" "Persistence" "FAIL" "pid $pid suspicious: $cmd" "Reverse shell / miner. Capture cmdline, hash the binary, kill it, then find how it starts."
+    if [[ "$cmd" =~ (nc[[:space:]]+-[le]|ncat|socat.*exec|/dev/tcp/|cryptominer|xmrig|minerd|kdevtmpfsi|\bzod\b) ]]; then
+      finding "PROC-$pid" "Persistence" "FAIL" "pid $pid suspicious: $cmd" "Reverse shell / miner / backdoor. Capture cmdline, hash the binary, kill it, then find how it starts."
     fi
   done < <(ps -eo pid,ppid,user,etimes,args 2>/dev/null)
+
+  # flag listening binaries that are NOT owned by any distro package (catches zod, custom netcat, etc.)
+  if command -v dpkg >/dev/null 2>&1 || command -v rpm >/dev/null 2>&1; then
+    local lpid exe real_exe
+    while read -r lpid; do
+      [[ "$lpid" =~ ^[0-9]+$ ]] || continue
+      exe="$(readlink -f "/proc/$lpid/exe" 2>/dev/null)"
+      [[ -n "$exe" && -f "$exe" ]] || continue
+      if command -v dpkg >/dev/null 2>&1; then
+        if ! dpkg -S "$exe" >/dev/null 2>&1; then
+          real_exe="$(ps -p "$lpid" -o args= 2>/dev/null)"
+          printf 'pid=%s exe=%s cmd=%s\n' "$lpid" "$exe" "$real_exe" >>"$EVID/35-nonpackaged-procs.txt"
+          finding "PROC-UNPKG-$lpid" "Persistence" "WARN" "listening pid $lpid runs unpackaged binary: $exe" \
+            "Verify if this binary belongs to a manually installed critical service or is a custom backdoor (e.g. zod/netcat)."
+        fi
+      elif command -v rpm >/dev/null 2>&1; then
+        if ! rpm -qf "$exe" >/dev/null 2>&1; then
+          real_exe="$(ps -p "$lpid" -o args= 2>/dev/null)"
+          printf 'pid=%s exe=%s cmd=%s\n' "$lpid" "$exe" "$real_exe" >>"$EVID/35-nonpackaged-procs.txt"
+          finding "PROC-UNPKG-$lpid" "Persistence" "WARN" "listening pid $lpid runs unpackaged binary: $exe" \
+            "Verify if this binary belongs to a manually installed critical service or is a custom backdoor."
+        fi
+      fi
+    done < <(awk -F'\t' '{print $4}' "$EVID/20-listening.tsv" 2>/dev/null | sort -u)
+  fi
+
+  # stray executables in /dev or /boot
+  local devbin
+  devbin="$(find /dev /boot -maxdepth 2 -type f -perm /111 2>/dev/null | grep -vE '^/boot/(vmlinuz|initrd|efi|grub)' | tr '\n' ' ')"
+  [[ -n "$devbin" ]] && finding "BACKDOOR-DEVBOOT" "Persistence" "FAIL" "executable file(s) in /dev or /boot: $devbin" \
+    "Inspect, hash, and remove backdoor executables hidden in /dev or /boot."
+
+  # browser wrapper trojan / extension check
+  { echo "### browser binaries"; file /usr/bin/firefox /usr/bin/chromium* /usr/bin/google-chrome* 2>/dev/null
+    echo; echo "### firefox system addons"; ls -la /usr/lib/firefox-addons/extensions/ /usr/lib/firefox/browser/extensions/ 2>/dev/null
+    echo; echo "### user mozilla profiles"; ls -la /home/*/.mozilla/firefox/ 2>/dev/null
+  } >"$EVID/36-browser-check.txt"
+  local bbin
+  for bbin in /usr/bin/firefox /usr/bin/chromium /usr/bin/chromium-browser; do
+    [[ -f "$bbin" ]] || continue
+    if grep -qE '(curl |wget |nc |ncat|/dev/tcp/|python[23]? -c)' "$bbin" 2>/dev/null; then
+      finding "BROWSER-TROJAN" "Persistence" "FAIL" "$bbin contains suspicious network/shell payload" \
+        "Browser wrapper trojan detected! Reinstall browser package and inspect $bbin."
+    fi
+  done
 
   # deleted-but-running binaries
   ls -l /proc/[0-9]*/exe 2>/dev/null | grep -i '(deleted)' >"$EVID/34-deleted-exe.txt"
@@ -750,10 +906,68 @@ do_recon() {
       "Classic fileless malware. cat /proc/<pid>/cmdline, dump the binary with cat /proc/<pid>/exe > /root/evidence.bin, then kill."
   fi
 
-  # ---- file integrity-ish checks ----------------------------------------------
-  step "file permissions / SUID / world-writable"
-  find / -xdev \( -path /proc -o -path /sys -o -path /run -o -path "$EVID" -o -path "$BKROOT" \) -prune -o \
-    -type f \( -perm -4000 -o -perm -2000 \) -printf '%M %u:%g %p\n' 2>/dev/null | sort >"$EVID/40-suid-sgid.txt"
+  # ---- file integrity-ish checks (single-pass GNU find) ----------------------
+  step "file permissions / SUID / world-writable / media / archives"
+  : >"$EVID/40-suid-sgid.txt"
+  : >"$EVID/41-world-writable.txt"
+  : >"$EVID/42-ww-dirs.txt"
+  : >"$EVID/43-unowned.txt"
+  : >"$EVID/50-recent-files.txt"
+  : >"$EVID/52-media-found.txt"
+  : >"$EVID/53-archives-found.txt"
+
+  if find --version 2>/dev/null | grep -qi 'GNU'; then
+    local _suid_raw="$EVID/.suid-raw.txt" _ww_raw="$EVID/.ww-raw.txt" _wwd_raw="$EVID/.wwd-raw.txt"
+    local _uo_raw="$EVID/.uo-raw.txt" _rec_raw="$EVID/.rec-raw.txt" _med_raw="$EVID/.med-raw.txt" _arc_raw="$EVID/.arc-raw.txt"
+    : >"$_suid_raw"; : >"$_ww_raw"; : >"$_wwd_raw"; : >"$_uo_raw"; : >"$_rec_raw"; : >"$_med_raw"; : >"$_arc_raw"
+    find / -xdev \( -path /proc -o -path /sys -o -path /run -o -path /dev -o -path /snap -o -path /var/lib/docker -o -path "$EVID" -o -path "$BKROOT" \) -prune -o \
+      \( -type f \( -perm -4000 -o -perm -2000 \) -fprintf "$_suid_raw" '%M %u:%g %p\n' , \
+         -type f -perm -0002 ! -perm -1000 -fprintf "$_ww_raw" '%M %u:%g %p\n' , \
+         -type d -perm -0002 ! -perm -1000 -fprintf "$_wwd_raw" '%p\n' , \
+         \( -nouser -o -nogroup \) -fprintf "$_uo_raw" '%p\n' , \
+         -type f -mtime -180 ! -path '/var/lib/*' ! -path '/var/cache/*' -fprintf "$_rec_raw" '%T+ %M %u:%g %s %p\n' , \
+         -type f \( -iname '*.mp3' -o -iname '*.mp4' -o -iname '*.avi' -o -iname '*.mkv' \
+            -o -iname '*.mov' -o -iname '*.wmv' -o -iname '*.flv' -o -iname '*.wav' \
+            -o -iname '*.ogg' -o -iname '*.flac' -o -iname '*.m4a' -o -iname '*.m4v' \
+            -o -iname '*.wma' -o -iname '*.aiff' -o -iname '*.mid' -o -iname '*.midi' \
+            -o -iname '*.mpeg' -o -iname '*.mpg' -o -iname '*.3gp' -o -iname '*.swf' \
+            -o -iname '*.torrent' -o -iname '*.pcap' \) ! -path '/usr/share/*' -fprintf "$_med_raw" '%p\n' , \
+         \( -type f -o -type d \) \( -iname '*pyrdp*' -o -iname '*doona*' -o -iname '*xprobe*' \
+            -o -iname '*backdoor*' -o -iname '*mimikatz*' -o -iname '*linpeas*' -o -iname '*metasploit*' \
+            -o -iname '*sqlmap*' -o -iname '*impacket*' -o -iname '*responder*' -o -iname '*chisel*' \
+            -o -iname '*.tar.gz' -o -iname '*.tgz' -o -iname '*.tar.bz2' -o -iname '*.tar.xz' \
+            -o -iname '*.zip' -o -iname '*.rar' -o -iname '*.7z' -o -iname '*.deb' -o -iname '*.rpm' \
+            -o -iname '*.AppImage' \) ! -path '/usr/share/*' ! -path '/var/lib/apt/*' ! -path '/var/cache/*' ! -path '/usr/lib/*' \
+            -fprintf "$_arc_raw" '%p\n' \) 2>/dev/null
+    sort "$_suid_raw" >"$EVID/40-suid-sgid.txt"
+    head -500 "$_ww_raw" >"$EVID/41-world-writable.txt"
+    head -200 "$_wwd_raw" >"$EVID/42-ww-dirs.txt"
+    head -200 "$_uo_raw" >"$EVID/43-unowned.txt"
+    sort -r "$_rec_raw" | head -3000 >"$EVID/50-recent-files.txt"
+    sort -u "$_med_raw" >"$EVID/52-media-found.txt"
+    sort -u "$_arc_raw" | head -500 >"$EVID/53-archives-found.txt"
+    rm -f "$_suid_raw" "$_ww_raw" "$_wwd_raw" "$_uo_raw" "$_rec_raw" "$_med_raw" "$_arc_raw"
+  else
+    find / -xdev \( -path /proc -o -path /sys -o -path /run -o -path "$EVID" -o -path "$BKROOT" \) -prune -o \
+      -type f \( -perm -4000 -o -perm -2000 \) -printf '%M %u:%g %p\n' 2>/dev/null | sort >"$EVID/40-suid-sgid.txt"
+    find / -xdev \( -path /proc -o -path /sys -o -path /run -o -path /dev -o -path "$EVID" -o -path "$BKROOT" \) -prune -o \
+      -type f -perm -0002 ! -perm -1000 -printf '%M %u:%g %p\n' 2>/dev/null | head -500 >"$EVID/41-world-writable.txt"
+    find / -xdev \( -path /proc -o -path /sys -o -path /run \) -prune -o -type d -perm -0002 ! -perm -1000 -print 2>/dev/null | head -200 >"$EVID/42-ww-dirs.txt"
+    find / -xdev \( -path /proc -o -path /sys -o -path /run \) -prune -o \( -nouser -o -nogroup \) -print 2>/dev/null | head -200 >"$EVID/43-unowned.txt"
+    find / -xdev \( -path /proc -o -path /sys -o -path /run -o -path "$EVID" -o -path "$BKROOT" -o -path /var/lib -o -path /var/cache \) -prune -o \
+      -type f -mtime -180 -printf '%T+ %M %u:%g %s %p\n' 2>/dev/null | sort -r | head -3000 >"$EVID/50-recent-files.txt"
+    find / -xdev -type f \( \
+          -iname '*.mp3' -o -iname '*.mp4' -o -iname '*.avi' -o -iname '*.mkv' \
+          -o -iname '*.mov' -o -iname '*.wmv' -o -iname '*.flv' -o -iname '*.wav' \
+          -o -iname '*.ogg' -o -iname '*.flac' -o -iname '*.m4a' -o -iname '*.m4v' \
+          -o -iname '*.torrent' -o -iname '*.pcap' \
+          \) 2>/dev/null | grep -v '/usr/share/' >"$EVID/52-media-found.txt"
+    find /home /root /opt /tmp /var/tmp /srv /var/www /usr/local -xdev \
+      \( -iname '*pyrdp*' -o -iname '*doona*' -o -iname '*xprobe*' -o -iname '*backdoor*' \
+         -o -iname '*.tar.gz' -o -iname '*.tgz' -o -iname '*.zip' -o -iname '*.rar' -o -iname '*.7z' -o -iname '*.deb' \) \
+      2>/dev/null | head -500 >"$EVID/53-archives-found.txt"
+  fi
+
   ok "SUID/SGID list: $(wc -l <"$EVID/40-suid-sgid.txt") entries -> $EVID/40-suid-sgid.txt"
 
   # Two very different buckets. distro-default SUID binaries (mount, su,
@@ -794,14 +1008,11 @@ locate pppd write expire login kismet_capture"
   done <"$EVID/40-suid-sgid.txt"
   (( ndanger == 0 )) && finding "SUID-DANGER" "Permissions" "PASS" "no dangerous SUID binaries (only distro defaults)"
 
-  find / -xdev \( -path /proc -o -path /sys -o -path /run -o -path /dev -o -path "$EVID" -o -path "$BKROOT" \) -prune -o \
-    -type f -perm -0002 ! -perm -1000 -printf '%M %u:%g %p\n' 2>/dev/null | head -500 >"$EVID/41-world-writable.txt"
   local wwc; wwc="$(wc -l <"$EVID/41-world-writable.txt")"
   if (( wwc > 0 )); then
     finding "PERM-WW" "Permissions" "WARN" "$wwc world-writable file(s) without the sticky bit" \
       "chmod o-w on each one. world-writable /etc files and scripts in PATH are the scored ones."
   fi
-  find / -xdev \( -path /proc -o -path /sys -o -path /run \) -prune -o -type d -perm -0002 ! -perm -1000 -print 2>/dev/null | head -200 >"$EVID/42-ww-dirs.txt"
   (( $(wc -l <"$EVID/42-ww-dirs.txt") > 0 )) && finding "PERM-WWDIR" "Permissions" "WARN" "$(wc -l <"$EVID/42-ww-dirs.txt") world-writable dir(s) missing +t" "chmod +t or chmod o-w."
 
   # critical config perms. compare "no more permissive than" rather than exact
@@ -822,7 +1033,6 @@ locate pppd write expire login kismet_capture"
                         "/etc/ssh/sshd_config 600" "/etc/sudoers 440" "/etc/crontab 644" \
                         "/boot/grub/grub.cfg 600")
 
-  find / -xdev \( -path /proc -o -path /sys -o -path /run \) -prune -o \( -nouser -o -nogroup \) -print 2>/dev/null | head -200 >"$EVID/43-unowned.txt"
   (( $(wc -l <"$EVID/43-unowned.txt") > 0 )) && finding "PERM-UNOWNED" "Permissions" "WARN" "$(wc -l <"$EVID/43-unowned.txt") file(s) with no owner/group" "chown root:root them (or the right service user)."
 
   # home directory perms -- what matters is a group/other WRITE bit
@@ -839,6 +1049,13 @@ locate pppd write expire login kismet_capture"
     [[ -f "$home/.netrc" ]] && finding "PERM-NETRC-$name" "Persistence" "WARN" "$home/.netrc exists" "Often contains plaintext FTP/HTTP creds."
   done < <(getent passwd)
 
+  # hidden trick filenames in /home and /root (e.g. '...', '..passwords', '.  ')
+  find /home /root -maxdepth 4 \( -name '...' -o -name '..?*' -o -name '. *' -o -iname '*.hacker*' \) 2>/dev/null >"$EVID/54-hidden-trick-files.txt"
+  if [[ -s "$EVID/54-hidden-trick-files.txt" ]]; then
+    finding "FILES-TRICK" "Files" "WARN" "suspicious hidden trick file(s)/dir(s) in /home or /root -> $EVID/54-hidden-trick-files.txt" \
+      "Inspect $(head -3 "$EVID/54-hidden-trick-files.txt" | tr '\n' ' ') -- attackers hide tools/passwords in '...' or '..*' names."
+  fi
+
   # immutable attributes (attackers love chattr +i)
   if command -v lsattr >/dev/null 2>&1; then
     # lsattr -R emits bare directory headers like "/etc/init.d:" which contain
@@ -852,22 +1069,19 @@ locate pppd write expire login kismet_capture"
     fi
   fi
 
-  # ---- recently touched files ------------------------------------------------
-  step "recently modified files"
-  find / -xdev \( -path /proc -o -path /sys -o -path /run -o -path "$EVID" -o -path "$BKROOT" -o -path /var/lib -o -path /var/cache \) -prune -o \
-    -type f -mtime -180 -printf '%T+ %M %u:%g %s %p\n' 2>/dev/null | sort -r | head -3000 >"$EVID/50-recent-files.txt"
+  # package integrity check (debsums if installed, timeout-capped)
+  if command -v debsums >/dev/null 2>&1; then
+    timeout 25 debsums -c 2>/dev/null | head -100 >"$EVID/45-debsums.txt"
+    if [[ -s "$EVID/45-debsums.txt" ]]; then
+      finding "PKG-DEBSUMS" "Files" "WARN" "$(wc -l <"$EVID/45-debsums.txt") packaged file(s) modified from checksum -> $EVID/45-debsums.txt" \
+        "Modified binaries in /usr/bin or /sbin indicate trojaned system tools. Inspect and reinstall affected packages."
+    fi
+  fi
+
   ok "recent files -> $EVID/50-recent-files.txt ($(wc -l <"$EVID/50-recent-files.txt") rows)"
 
-  # ---- prohibited media hunt ---------------------------------------------------
-  step "prohibited media hunt"
-  find / -xdev -type f \( \
-        -iname '*.mp3' -o -iname '*.mp4' -o -iname '*.avi' -o -iname '*.mkv' \
-        -o -iname '*.mov' -o -iname '*.wmv' -o -iname '*.flv' -o -iname '*.wav' \
-        -o -iname '*.ogg' -o -iname '*.flac' -o -iname '*.m4a' -o -iname '*.m4v' \
-        -o -iname '*.torrent' -o -iname '*.pcap' \
-        \) 2>/dev/null | grep -v '/usr/share/' | tee "$EVID/52-media-found.txt" | head -40 | sed 's/^/    /'
-  # NB: no `|| echo 0` here -- grep already prints 0 and exits 1 on an empty
-  # file, so the fallback would append a second 0 and break the arithmetic.
+  # ---- prohibited media & archive results ----------------------------------
+  head -40 "$EVID/52-media-found.txt" | sed 's/^/    /'
   local mc; mc="$(grep -vc '^[[:space:]]*$' "$EVID/52-media-found.txt" 2>/dev/null)"
   [[ -z "$mc" ]] && mc=0
   if (( mc > 0 )); then
@@ -875,6 +1089,14 @@ locate pppd write expire login kismet_capture"
       "Delete ONLY what the README calls prohibited. /usr/share backgrounds are already filtered out -- those are fine."
   else
     finding "MEDIA" "Files" "PASS" "no media files outside /usr/share"
+  fi
+
+  local ac; ac="$(grep -vc '^[[:space:]]*$' "$EVID/53-archives-found.txt" 2>/dev/null)"
+  [[ -z "$ac" ]] && ac=0
+  if (( ac > 0 )); then
+    head -20 "$EVID/53-archives-found.txt" | sed 's/^/    /'
+    finding "ARCHIVES" "Files" "WARN" "$ac archive/prohibited-tool candidate(s) -> $EVID/53-archives-found.txt" \
+      "Check for unauthorized software archives (e.g. pyrdp, doona, xprobe, netcat tarballs/zips) in home/opt/tmp and remove if prohibited."
   fi
 
   # ---- PII / secrets grep (report only, NEVER delete) ---------------------------
@@ -939,6 +1161,10 @@ locate pppd write expire login kismet_capture"
     # password IS the finding.
     local placeholder='^(your|their|my|the|some|new|old|enter|insert|type)[_.-]?(password|passwd|pwd|passphrase|secret|key|token|credential)|[_-]here$|^-here$|^placeholder$|^example$|^sample$|^dummy$|^lorem|^x{3,}$|^\*+$|^\.+$'
 
+    # Batch pre-filter with xargs+grep to avoid spawning subshells on clean files.
+    local pii_hits="$EVID/.pii-prefilter"
+    head -4000 "$pii_files" | tr '\n' '\0' | xargs -0 -r grep -IlE "${pem_re}|${ssn_re}|${card_re}|${cred_keys}" 2>/dev/null >"$pii_hits" || true
+
     while IFS= read -r f; do
       [[ -f "$f" ]] || continue
       local hit="" m v k vn body is_template
@@ -972,7 +1198,8 @@ locate pppd write expire login kismet_capture"
         hit="card-pattern"
       fi
       [[ -n "$hit" ]] && printf '%s\t%s\n' "$hit" "$f" >>"$EVID/51-pii-candidates.txt"
-    done < <(head -4000 "$pii_files")
+    done <"$pii_hits"
+    rm -f "$pii_hits"
   fi
   rm -f "$pii_files"
 
@@ -1029,42 +1256,101 @@ locate pppd write expire login kismet_capture"
 
   # ---- packages -----------------------------------------------------------------
   step "packages"
+  local pkg_cache="$EVID/.installed-pkgs"
+  : >"$pkg_cache"
   case "$PKG" in
     apt)
       apt-mark showmanual >"$EVID/70-manual-packages.txt" 2>&1
       dpkg -l >"$EVID/70-dpkg.txt" 2>&1
+      dpkg-query -W -f='${Package}\n' 2>/dev/null | sort -u >"$pkg_cache"
       zgrep -h . /var/log/dpkg.log* 2>/dev/null | tail -2000 >"$EVID/70-dpkg-log.txt"
       zgrep -h . /var/log/apt/history.log* 2>/dev/null >"$EVID/70-apt-history.txt"
+      # insecure APT config / missing security pocket check
+      if grep -REiq '(AllowUnauthenticated|AllowInsecureRepositories|Verify-Peer.*false|trusted=yes)' /etc/apt/apt.conf* /etc/apt/sources.list* 2>/dev/null; then
+        finding "PKG-APT-SEC" "Updates" "FAIL" "insecure APT option (AllowUnauthenticated / trusted=yes) found in /etc/apt/" \
+          "Remove AllowUnauthenticated/AllowInsecureRepositories/trusted=yes from /etc/apt/."
+      fi
+      if [[ -d /etc/apt ]] && ! grep -REq '^[^#]*security' /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources 2>/dev/null; then
+        finding "PKG-APT-REPO" "Updates" "WARN" "no active security repository detected in /etc/apt/sources*" \
+          "Uncomment or add the distro security repo in /etc/apt/sources.list so security updates actually install."
+      fi
       ;;
     dnf|yum)
       dnf history list >"$EVID/70-dnf-history.txt" 2>&1 || yum history list >"$EVID/70-dnf-history.txt" 2>&1
       rpm -qa --qf '%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}\t%{INSTALLTIME:date}\n' | sort >"$EVID/70-rpm.txt" 2>&1
+      rpm -qa --qf '%{NAME}\n' 2>/dev/null | sort -u >"$pkg_cache"
       ;;
-    zypper) rpm -qa >"$EVID/70-rpm.txt" 2>&1 ;;
-    pacman) pacman -Qe >"$EVID/70-explicit.txt" 2>&1; pacman -Q >"$EVID/70-all.txt" 2>&1 ;;
+    zypper)
+      rpm -qa >"$EVID/70-rpm.txt" 2>&1
+      rpm -qa --qf '%{NAME}\n' 2>/dev/null | sort -u >"$pkg_cache"
+      ;;
+    pacman)
+      pacman -Qe >"$EVID/70-explicit.txt" 2>&1; pacman -Q >"$EVID/70-all.txt" 2>&1
+      pacman -Qq 2>/dev/null | sort -u >"$pkg_cache"
+      ;;
   esac
-  local badpkgs="telnet telnetd rsh-server rsh-client rlogin rexec ypserv tftp tftpd talk talkd \
-                 xinetd finger fingerd nmap zenmap netcat netcat-openbsd ncat socat \
-                 john john-data hashcat hydra aircrack-ng metasploit-framework nikto sqlmap wireshark \
-                 ophcrack ettercap-common medusa dsniff tcpflow kismet netdiscover logkeys \
-                 transmission-.* deluge.* qbittorrent freeciv.* minetest.* supertux.* wesnoth.* \
-                 gnome-mines gnome-sudoku aisleriot quadrapassel frozen-bubble"
+  local badpkgs="telnet telnetd telnetd-ssl inetutils-telnet inetutils-telnetd \
+                 rsh-server rsh-client rlogin rexec ypserv nis tftp tftpd tftpd-hpa \
+                 talk talkd inetutils-talk inetutils-talkd finger fingerd \
+                 xinetd openbsd-inetd inetutils-inetd inetutils-ftpd \
+                 nmap zenmap masscan nbtscan hping3 netdiscover arp-scan \
+                 netcat netcat-traditional netcat-openbsd ncat pnetcat socat sbd \
+                 john john-data hashcat hydra hydra-gtk medusa ncrack patator \
+                 ophcrack ophcrack-cli crack crack-common fcrackzip lcrack pdfcrack rarcrack sipcrack \
+                 aircrack-ng pyrit weplab reaver wifite bully cowpatty kismet \
+                 metasploit-framework armitage beef-xss nikto sqlmap wpscan skipfish \
+                 gobuster dirb ffuf wfuzz enum4linux smbmap responder \
+                 wireshark wireshark-qt tshark tcpdump tcpflow ettercap-common ettercap-graphical \
+                 bettercap dsniff driftnet yersinia irpas snort burpsuite zaproxy \
+                 fakeroot maltego recon-ng theharvester amass \
+                 proxychains proxychains4 tor torsocks macchanger \
+                 doona xprobe xprobe2 pyrdp \
+                 logkeys lkl uberkey thc-vlogger pykeylogger \
+                 zeitgeist zeitgeist-core zeitgeist-datahub rhythmbox-plugin-zeitgeist \
+                 vnc4server x11vnc tightvncserver tigervnc-standalone-server xrdp \
+                 snmp snmpd autofs squid squid3 \
+                 dovecot-core dovecot-pop3d dovecot-imapd courier-pop qpopper popa3d \
+                 pure-ftpd proftpd-basic proftpd-core \
+                 transmission-.* deluge.* qbittorrent bittorrent frostwire vuze azureus rtorrent ktorrent amule \
+                 irssi hexchat weechat filezilla \
+                 freeciv.* minetest.* supertux.* supertuxkart wesnoth.* \
+                 gnome-games gnome-mines gnome-sudoku gnome-mahjongg gnome-nibbles gnome-robots \
+                 gnome-taquin gnome-tetravex hitori iagno lightsoff five-or-more four-in-a-row \
+                 swell-foop tali 2048 kmines kmahjongg kpat ksudoku \
+                 aisleriot quadrapassel frozen-bubble 0ad xonotic openarena pingus hedgewars \
+                 extremetuxracer armagetronad bastet nethack.* moon-buggy ninvaders bsdgames \
+                 steam.* lutris"
+  local bad_rx
+  bad_rx="^($(printf '%s\n' $badpkgs | paste -sd'|' -))$"
+  : >"$EVID/72-prohibited-packages.txt"
+  if [[ -s "$pkg_cache" ]]; then
+    grep -iE "$bad_rx" "$pkg_cache" 2>/dev/null | sort -u >"$EVID/72-prohibited-packages.txt"
+  fi
   local p
-  for p in $badpkgs; do
-    if pkg_has "$p" 2>/dev/null; then
-      case "$p" in
-        telnet|telnetd|rsh-server|rsh-client|ypserv|tftp|tftpd|talk|talkd|finger|fingerd|xinetd)
-          finding "PKG-$p" "Software" "FAIL" "$p is installed" "Insecure legacy daemon. Remove it (needs --aggressive) and confirm the port is closed." ;;
-        *)
-          finding "PKG-$p" "Software" "WARN" "$p is installed" \
-            "Attack tooling / game / p2p on a business host = policy violation. Confirm against the README, then purge and document it." ;;
-      esac
-    fi
-  done
+  while IFS= read -r p; do
+    [[ -z "$p" ]] && continue
+    case "$p" in
+      telnet*|inetutils-telnet*|rsh-*|rlogin|rexec|ypserv|nis|tftp*|talk*|inetutils-talk*|finger*|xinetd|openbsd-inetd|inetutils-inetd)
+        finding "PKG-$p" "Software" "FAIL" "$p is installed" "Insecure legacy daemon. Remove it (needs --aggressive or packages module) and confirm the port is closed." ;;
+      *)
+        finding "PKG-$p" "Software" "WARN" "$p is installed" \
+          "Attack tooling / game / p2p / unauthorized daemon on a business host = policy violation. Confirm against the README, then purge and document it." ;;
+    esac
+  done <"$EVID/72-prohibited-packages.txt"
+  rm -f "$pkg_cache"
+
   # manually installed stuff not from the distro
   find /usr/local/bin /usr/local/sbin /opt -maxdepth 2 -type f -perm /111 2>/dev/null >"$EVID/71-local-binaries.txt"
   (( $(wc -l <"$EVID/71-local-binaries.txt") > 0 )) && finding "PKG-LOCAL" "Software" "INFO" "$(wc -l <"$EVID/71-local-binaries.txt") binary(ies) outside the package manager" \
     "Anything in /usr/local/bin or /opt the package manager does not own deserves a look. sha256sum it and check the README."
+
+  # SSH drop-in conflict scan
+  if [[ -d /etc/ssh/sshd_config.d ]]; then
+    local ssh_bad
+    ssh_bad="$(grep -REin '^[[:space:]]*(PermitRootLogin[[:space:]]+yes|PermitEmptyPasswords[[:space:]]+yes|X11Forwarding[[:space:]]+yes)' /etc/ssh/sshd_config.d/*.conf 2>/dev/null | head -5)"
+    [[ -n "$ssh_bad" ]] && finding "SSH-DROPIN" "SSH" "FAIL" "insecure directive in /etc/ssh/sshd_config.d/: $(echo "$ssh_bad" | tr '\n' ' ')" \
+      "OpenSSH uses first-match-wins! Clean up conflicting drop-in files in /etc/ssh/sshd_config.d/."
+  fi
 
   # ---- bootloader ------------------------------------------------------------------
   step "boot"
@@ -1112,11 +1398,16 @@ do_users() {
   local made=0
   [[ -f "$SCRIPT_DIR/users.txt"  ]] || { (( DRY )) || { printf '# standard (non-admin) users from the README, one per line\n' >"$SCRIPT_DIR/users.txt"; made=1; } ; }
   [[ -f "$SCRIPT_DIR/admins.txt" ]] || { (( DRY )) || { printf '# administrators from the README, one per line\n'            >"$SCRIPT_DIR/admins.txt"; made=1; }; }
-  (( made )) && warn "users.txt / admins.txt templates created next to the script."
+  [[ -f "$SCRIPT_DIR/groups.txt" ]] || { (( DRY )) || { printf '# custom groups from the README, format: groupname:user1,user2\n' >"$SCRIPT_DIR/groups.txt"; made=1; }; }
+  (( made )) && warn "users.txt / admins.txt / groups.txt templates created next to the script."
 
-  local -a A=() S=()
+  local -a A=() S=() G=()
   mapfile -t A < <(read_list "$SCRIPT_DIR/admins.txt" '# administrators from the README, one per line' || true)
   mapfile -t S < <(read_list "$SCRIPT_DIR/users.txt"  '# standard (non-admin) users from the README, one per line' || true)
+  mapfile -t G < <(read_list "$SCRIPT_DIR/groups.txt" '# custom groups from the README, format: groupname:user1,user2' || true)
+  local admin_grp="sudo"
+  getent group sudo >/dev/null 2>&1 || { getent group wheel >/dev/null 2>&1 && admin_grp="wheel"; }
+
   if (( ${#A[@]} + ${#S[@]} == 0 )); then
     warn "users.txt / admins.txt are empty. fill them in from the README, then run users again."
     review "users.txt/admins.txt empty: account reconciliation skipped"
@@ -1140,7 +1431,11 @@ do_users() {
         continue
       fi
       if ask "Delete '$u' and their home directory?"; then
-        act deluser --remove-home "$u" && change "user:$u" "present" "deleted"
+        if command -v deluser >/dev/null 2>&1; then
+          act deluser --remove-home "$u" && change "user:$u" "present" "deleted"
+        else
+          act userdel -r "$u" && change "user:$u" "present" "deleted"
+        fi
       else
         review "unlisted account '$u' left in place"
       fi
@@ -1149,23 +1444,74 @@ do_users() {
     # 2. accounts the README wants that are missing
     for n in "${!isok[@]}"; do
       id "$n" &>/dev/null && continue
-      ask "'$n' is on the lists but does not exist. Create it?" && act adduser --disabled-password --gecos "" "$n"
+      if ask "'$n' is on the lists but does not exist. Create it?"; then
+        if command -v adduser >/dev/null 2>&1 && [[ "$PKG" == "apt" ]]; then
+          act adduser --disabled-password --gecos "" "$n"
+        else
+          act useradd -m -s /bin/bash "$n"
+        fi
+      fi
     done
     mapfile -t real < <(awk -F: '$3>=1000 && $3<65534 {print $1}' /etc/passwd)
 
-    # 3. sudo membership
-    local insudo
+    # 3. sudo / wheel / admin / nopasswdlogin membership
+    local insudo ag
     for u in "${real[@]}"; do
       [[ -n "${isok[$u]:-}" ]] || continue
       insudo=0
-      id -nG "$u" | tr ' ' '\n' | grep -qx sudo && insudo=1
+      id -nG "$u" | tr ' ' '\n' | grep -qx "$admin_grp" && insudo=1
       if [[ -n "${isadmin[$u]:-}" ]]; then
-        (( insudo )) || { ask "'$u' is an admin per the README but not in sudo. Add?" && act usermod -aG sudo "$u"; }
+        (( insudo )) || { ask "'$u' is an admin per the README but not in $admin_grp. Add?" && act usermod -aG "$admin_grp" "$u"; }
       else
-        (( insudo )) && { ask "'$u' is in sudo but is a standard user. Remove?" && act gpasswd -d "$u" sudo; }
+        for ag in sudo wheel admin adm root nopasswdlogin; do
+          getent group "$ag" >/dev/null 2>&1 || continue
+          if id -nG "$u" | tr ' ' '\n' | grep -qx "$ag"; then
+            ask "'$u' is in '$ag' but is a standard user. Remove from '$ag'?" && act gpasswd -d "$u" "$ag"
+          fi
+        done
       fi
     done
-    say "current sudo/admin members:"; getent group sudo admin 2>/dev/null | sed 's/^/    /'
+    say "current sudo/wheel/admin members:"; getent group sudo wheel admin nopasswdlogin 2>/dev/null | sed 's/^/    /'
+  fi
+
+  # 3b. custom groups from groups.txt + interactive group helper
+  if (( ${#G[@]} > 0 )); then
+    local gspec gname gmembers gm
+    for gspec in "${G[@]}"; do
+      gname="${gspec%%:*}"
+      gmembers=""
+      [[ "$gspec" == *:* ]] && gmembers="${gspec#*:}"
+      [[ -n "$gname" ]] || continue
+      if ! getent group "$gname" >/dev/null 2>&1; then
+        act groupadd "$gname" && { ok "created group '$gname'"; change "group:$gname" "absent" "created"; }
+      fi
+      if [[ -n "$gmembers" ]]; then
+        IFS=',' read -ra _gm_arr <<< "$gmembers"
+        for gm in "${_gm_arr[@]}"; do
+          [[ -n "$gm" ]] || continue
+          id "$gm" &>/dev/null || { warn "groups.txt: user '$gm' does not exist"; continue; }
+          if ! id -nG "$gm" | tr ' ' '\n' | grep -qx "$gname"; then
+            act usermod -aG "$gname" "$gm" && ok "added '$gm' to '$gname'"
+          fi
+        done
+      fi
+    done
+  fi
+  if [[ -t 0 && $DRY -eq 0 && $PARANOID -eq 0 ]]; then
+    if ask "Create a custom group or edit group membership interactively?"; then
+      local cg cu
+      read -r -p "  group name (blank to skip): " cg
+      if [[ -n "$cg" ]]; then
+        getent group "$cg" >/dev/null 2>&1 || { act groupadd "$cg" && ok "created group '$cg'"; }
+        read -r -p "  comma-separated users to add to '$cg' (blank for none): " cu
+        if [[ -n "$cu" ]]; then
+          IFS=',' read -ra _cu_arr <<< "${cu//[[:space:]]/}"
+          for u in "${_cu_arr[@]}"; do
+            [[ -n "$u" ]] && id "$u" &>/dev/null && act usermod -aG "$cg" "$u"
+          done
+        fi
+      fi
+    fi
   fi
 
   # 4. one strong password on every authorized account (optional)
@@ -1208,10 +1554,17 @@ do_users() {
     "You will not be able to log in as root. usermod -s /bin/bash root" || \
     finding "USER-ROOTSHELL" "Accounts" "PASS" "root shell = $rc"
 
-  # 6. empty password fields -> lock (locking is reversible, deleting is not)
+  # 6. empty password fields -> set password for root or lock (locking is reversible, deleting is not)
   while IFS=: read -r name pass rest; do
     if [[ -z "$pass" ]]; then
-      if [[ $DRY -eq 1 || $PARANOID -eq 1 ]]; then warn "paranoid/dry: would lock '$name' (empty password)"; continue; fi
+      if [[ $DRY -eq 1 || $PARANOID -eq 1 ]]; then warn "paranoid/dry: would lock/fix '$name' (empty password)"; continue; fi
+      if [[ "$name" == "root" && -t 0 ]]; then
+        warn "root has a BLANK password!"
+        if ask "Set a strong password on root now? (No = prompt to lock root)"; then
+          passwd root && { ok "root password set"; change "passwd:root" "empty" "set"; }
+          continue
+        fi
+      fi
       if confirm "Lock account '$name' (empty password)? Say no if the README authorizes it."; then
         passwd -l "$name" >/dev/null 2>&1 && { ok "locked $name"; change "lock:$name" "empty password" "locked"; }
       else
@@ -1239,10 +1592,10 @@ do_users() {
   local rootgrp; rootgrp="$(getent group root | cut -d: -f4)"
   [[ -n "$rootgrp" ]] && finding "GRP-ROOT" "Accounts" "WARN" "group 'root' has members: $rootgrp" \
     "gpasswd -d <user> root unless the README wants it."
-  for g in wheel sudo admin; do
+  for g in wheel sudo admin nopasswdlogin; do
     local m2; m2="$(getent group "$g" 2>/dev/null | cut -d: -f4)"
     [[ -n "$m2" ]] && finding "GRP-$g" "Accounts" "INFO" "$g members: $m2" \
-      "Every member of $g can become root. Verify each against the README authorized-user list."
+      "Every member of $g has elevated/passwordless access. Verify each against the README authorized-user list."
   done
   local du duid
   du="$(cut -d: -f1 /etc/passwd | sort | uniq -d | tr '\n' ' ')"
@@ -1281,8 +1634,10 @@ do_users() {
   finding "LD-UMASK" "Accounts" "PASS" "login.defs UMASK=027"
   finding "LD-PASSLEN" "Accounts" "PASS" "login.defs PASS_MIN_LEN=14, MAX_DAYS=90"
 
-  # 10. apply aging to existing interactive accounts
+  # 10. apply aging to existing interactive accounts + root + default inactive lock
   if [[ $DRY -eq 0 && $PARANOID -eq 0 ]]; then
+    command -v useradd >/dev/null 2>&1 && useradd -D -f 30 >/dev/null 2>&1
+    chage -M 90 -m 1 -W 14 root >/dev/null 2>&1 || true
     while IFS=: read -r name _ uid _ _ home shell; do
       (( uid < 1000 )) && continue
       [[ "$shell" =~ (nologin|false) ]] && continue
@@ -1290,11 +1645,11 @@ do_users() {
     done < <(getent passwd)
   fi
 
-  # 11. graphical login: guest + autologin
+  # 11. graphical login: guest + autologin (LightDM / GDM3 / MDM / SDDM)
   if [[ -d /etc/lightdm ]]; then
     act mkdir -p /etc/lightdm/lightdm.conf.d
     if [[ $DRY -eq 0 ]]; then
-      printf '[Seat:*]\nallow-guest=false\nautologin-user=\ngreeter-hide-users=true\ngreeter-show-manual-login=true\n' \
+      printf '[Seat:*]\nallow-guest=false\ngreeter-allow-guest=false\nautologin-guest=false\nautologin-user=\nautologin-user-timeout=0\ngreeter-hide-users=true\ngreeter-show-manual-login=true\n' \
         > /etc/lightdm/lightdm.conf.d/99-cbptlinux.conf
       ok "LightDM: guest + autologin off"
     else
@@ -1304,8 +1659,19 @@ do_users() {
   if [[ -f /etc/gdm3/custom.conf ]]; then
     ensure_line /etc/gdm3/custom.conf "^[[:space:]]*#?[[:space:]]*AutomaticLoginEnable" "AutomaticLoginEnable=false"
     ensure_line /etc/gdm3/custom.conf "^[[:space:]]*#?[[:space:]]*TimedLoginEnable"     "TimedLoginEnable=false"
+    if [[ $DRY -eq 0 ]]; then
+      mkdir -p /etc/dconf/profile /etc/dconf/db/gdm.d
+      printf 'user-db:user\nsystem-db:gdm\nfile-db:/usr/share/gdm/greeter-dconf-defaults\n' >/etc/dconf/profile/gdm
+      printf '[org/gnome/login-screen]\ndisable-user-list=true\ndisable-restart-buttons=true\nbanner-message-enable=true\n' >/etc/dconf/db/gdm.d/01-cbptlinux
+      command -v dconf >/dev/null 2>&1 && dconf update >/dev/null 2>&1 || true
+    fi
   fi
-  grep -rniE 'autologin|allow-guest' /etc/lightdm /etc/gdm3 /etc/sddm.conf* 2>/dev/null | grep -v '^.*:\s*#' | sed 's/^/    /'
+  if [[ -f /etc/mdm/mdm.conf ]]; then
+    ensure_line /etc/mdm/mdm.conf "^[[:space:]]*#?[[:space:]]*AllowRoot" "AllowRoot=false"
+    ensure_line /etc/mdm/mdm.conf "^[[:space:]]*#?[[:space:]]*AutomaticLoginEnable" "AutomaticLoginEnable=false"
+    ensure_line /etc/mdm/mdm.conf "^[[:space:]]*#?[[:space:]]*TimedLoginEnable" "TimedLoginEnable=false"
+  fi
+  grep -rniE 'autologin|allow-guest' /etc/lightdm /etc/gdm3 /etc/mdm /etc/sddm.conf* 2>/dev/null | grep -v '^.*:\s*#' | sed 's/^/    /'
 }
 
 # ---------------------------------------------------------------------------
@@ -1322,13 +1688,16 @@ do_passwords() {
     pacman) pkg_install libpwquality pam ;;
   esac
 
-  local have_pwq=0 have_faillock=0
+  local have_pwq=0 have_faillock=0 have_pwhist=0
   local so
   for so in /lib/x86_64-linux-gnu/security/pam_pwquality.so /lib64/security/pam_pwquality.so /lib/security/pam_pwquality.so; do
     [[ -f "$so" ]] && have_pwq=1
   done
   for so in /lib/x86_64-linux-gnu/security/pam_faillock.so /lib64/security/pam_faillock.so /lib/security/pam_faillock.so; do
     [[ -f "$so" ]] && have_faillock=1
+  done
+  for so in /lib/x86_64-linux-gnu/security/pam_pwhistory.so /lib64/security/pam_pwhistory.so /lib/security/pam_pwhistory.so; do
+    [[ -f "$so" ]] && have_pwhist=1
   done
 
   # --- pwquality config (distro neutral, read by pam_pwquality) ---
@@ -1382,27 +1751,56 @@ PWQ
     warn "PAM backups: ${pwfile}.cbptlinuxbak-$STAMP  (cp it back + reboot if you get locked out)"
   fi
 
+  local pwq_opts="retry=3 minlen=14 ucredit=-1 lcredit=-1 dcredit=-1 ocredit=-1 difok=4 enforce_for_root"
   if [[ $have_pwq -eq 1 ]]; then
     if [[ $DRY -eq 1 ]]; then
       say "[dry-run] wire pam_pwquality into $pwfile"
     elif grep -q 'pam_pwquality.so' "$pwfile"; then
-      sed -i -E 's|^([[:space:]]*password[[:space:]]+requisite[[:space:]]+pam_pwquality\.so).*$|\1 retry=3 enforce_for_root|' "$pwfile"
+      sed -i -E "s|^([[:space:]]*password[[:space:]]+requisite[[:space:]]+pam_pwquality\\.so).*$|\\1 ${pwq_opts}|" "$pwfile"
     else
       # insert right after the "password" section header / before pam_unix password
-      sed -i -E '0,/^password[[:space:]]/{s|^(password[[:space:]].*)$|password\trequisite\tpam_pwquality.so retry=3 enforce_for_root\n\1|}' "$pwfile"
-      grep -q 'pam_pwquality.so' "$pwfile" || printf 'password\trequisite\tpam_pwquality.so retry=3 enforce_for_root\n' >>"$pwfile"
+      sed -i -E "0,/^password[[:space:]]/{s|^(password[[:space:]].*)$|password\\trequisite\\tpam_pwquality.so ${pwq_opts}\\n\\1|}" "$pwfile"
+      grep -q 'pam_pwquality.so' "$pwfile" || printf 'password\trequisite\tpam_pwquality.so %s\n' "$pwq_opts" >>"$pwfile"
     fi
     ok "pam_pwquality wired into $pwfile"
-    finding "PAM-PWQ" "Passwords" "PASS" "pam_pwquality active"
+    finding "PAM-PWQ" "Passwords" "PASS" "pam_pwquality active (inline + pwquality.conf)"
   else
     finding "PAM-PWQ" "Passwords" "WARN" "pam_pwquality module not present" \
       "Install libpam-pwquality (Debian/Ubuntu) or libpwquality (RHEL). Without it, minlen in login.defs is not enforced."
   fi
 
+  # --- pwhistory (modern distros use pam_pwhistory in addition to pam_unix remember=) ---
+  if [[ $have_pwhist -eq 1 ]]; then
+    backup_file /etc/security/pwhistory.conf
+    if [[ $DRY -eq 0 ]]; then
+      mkdir -p /etc/security
+      cat >/etc/security/pwhistory.conf <<'PWH'
+# written by cbptlinux.sh
+remember = 12
+enforce_for_root
+use_authtok
+PWH
+      chmod 644 /etc/security/pwhistory.conf
+      local tmp_ph; tmp_ph="$(mktemp)"
+      grep -v 'pam_pwhistory\.so' "$pwfile" >"$tmp_ph"
+      awk 'BEGIN{done=0}
+           /^[[:space:]]*password[[:space:]].*pam_unix\.so/ && !done {
+             print "password\trequisite\t\tpam_pwhistory.so remember=12 use_authtok enforce_for_root"
+             done=1
+           }
+           { print }' "$tmp_ph" >"$pwfile"
+      rm -f "$tmp_ph"
+      ok "pam_pwhistory wired into $pwfile + /etc/security/pwhistory.conf"
+    else
+      say "[dry-run] wire pam_pwhistory into $pwfile"
+    fi
+    finding "PAM-PWHISTORY" "Passwords" "PASS" "pam_pwhistory active (remember=12)"
+  fi
+
   # pam_unix password options: remember + sha512 + rounds
   if grep -q 'pam_unix.so' "$pwfile"; then
     if [[ $DRY -eq 0 ]]; then
-      sed -i -E '/^[[:space:]]*password.*pam_unix\.so/ s/[[:space:]]+(use_authtok|nullok|obscure|sha512|remember=[0-9]+|rounds=[0-9]+|md5|bigcrypt)//g' "$pwfile"
+      sed -i -E '/^[[:space:]]*password.*pam_unix\.so/ s/[[:space:]]+(use_authtok|nullok_secure|nullok|obscure|sha512|remember=[0-9]+|rounds=[0-9]+|md5|bigcrypt)//g' "$pwfile"
       sed -i -E '/^[[:space:]]*password.*pam_unix\.so/ s|$| sha512 rounds=100000 remember=12 use_authtok obscure|' "$pwfile"
     else
       say "[dry-run] pam_unix password options (sha512, remember=12)"
@@ -1411,22 +1809,30 @@ PWQ
     finding "PAM-UNIX-HIST" "Passwords" "PASS" "password history = 12, sha512"
   fi
 
-  # remove nullok from the auth stack -- it is what allows blank passwords
-  if [[ -f "$authfile" ]] && grep -q 'nullok' "$authfile"; then
-    if [[ $DRY -eq 0 ]]; then
-      sed -i 's/[[:space:]]*nullok//g' "$authfile"
-      ok "removed 'nullok' from $authfile"
-    else
-      say "[dry-run] remove nullok from $authfile"
+  # remove nullok and nullok_secure across PAM stacks -- it is what allows blank passwords
+  local pf nullok_hit=0
+  for pf in "$authfile" "$pwfile" /etc/pam.d/common-auth /etc/pam.d/common-password /etc/pam.d/system-auth /etc/pam.d/password-auth /etc/pam.d/login /etc/pam.d/sshd; do
+    [[ -f "$pf" ]] || continue
+    if grep -qE 'nullok(_secure)?' "$pf"; then
+      nullok_hit=1
+      if [[ $DRY -eq 0 ]]; then
+        backup_file "$pf"
+        sed -i -E 's/[[:space:]]*nullok(_secure)?//g' "$pf"
+        ok "removed nullok/nullok_secure from $pf"
+      else
+        say "[dry-run] remove nullok/nullok_secure from $pf"
+      fi
     fi
-    finding "PAM-NULLOK" "Passwords" "PASS" "nullok removed from auth stack"
+  done
+  if (( nullok_hit )); then
+    finding "PAM-NULLOK" "Passwords" "PASS" "nullok/nullok_secure removed from PAM stacks"
   else
-    finding "PAM-NULLOK" "Passwords" "PASS" "no nullok in auth stack"
+    finding "PAM-NULLOK" "Passwords" "PASS" "no nullok/nullok_secure in PAM stacks"
   fi
 
   # --- lockout ---
   if [[ $have_faillock -eq 1 ]]; then
-    # faillock.conf (modern) -- cleaner than passing options on every PAM line
+    # faillock.conf (modern) + inline args so both conf-based and pam-file graders pass
     if [[ $DRY -eq 0 ]]; then
       mkdir -p /etc/security
       backup_file /etc/security/faillock.conf
@@ -1447,22 +1853,9 @@ FL
     fi
 
     # Wire it into the auth stack in the CORRECT positions.
-    #
-    # This matters more than it looks. With Debian's
-    #     auth [success=1 default=ignore] pam_unix.so
-    #     auth requisite  pam_deny.so
-    #     auth required   pam_permit.so
-    # a success skips exactly ONE line. So the layout has to be:
-    #     auth required   pam_faillock.so preauth
-    #     auth [success=1 default=ignore] pam_unix.so
-    #     auth [default=die] pam_faillock.so authfail     <- skipped on success
-    #     auth sufficient    pam_faillock.so authsucc     <- lands here on success
-    #     auth requisite  pam_deny.so
-    #
-    # Appending authfail at the END of the file (after pam_permit.so) makes it
-    # run on EVERY login, successful ones included, which trips the counter
-    # and locks the account after `deny` good logins. we did that once. don't.
     local wire=0 f="$authfile" nu nf
+    local fl_pre="preauth silent deny=5 fail_interval=900 unlock_time=900 even_deny_root root_unlock_time=900"
+    local fl_fail="authfail deny=5 fail_interval=900 unlock_time=900 even_deny_root root_unlock_time=900"
     [[ -f "$f" ]] || f=""
     if [[ -n "$f" ]]; then
       backup_file "$f"
@@ -1471,11 +1864,11 @@ FL
         local tmp; tmp="$(mktemp)"
         # self-healing: strip any faillock lines from earlier/incorrect runs first
         grep -v 'pam_faillock\.so' "$f" >"$tmp"
-        awk 'BEGIN{done=0}
+        awk -v pre="$fl_pre" -v fail="$fl_fail" 'BEGIN{done=0}
              /^[[:space:]]*auth[[:space:]].*pam_unix\.so/ && !done {
-               print "auth\trequired\t\tpam_faillock.so preauth"
+               print "auth\trequired\t\tpam_faillock.so " pre
                print
-               print "auth\t[default=die]\tpam_faillock.so authfail"
+               print "auth\t[default=die]\tpam_faillock.so " fail
                print "auth\tsufficient\t\tpam_faillock.so authsucc"
                done=1
                next
@@ -1507,9 +1900,7 @@ FL
     fi
     (( wire )) && finding "PAM-LOCKOUT" "Passwords" "PASS" "pam_faillock: 5 failures -> 15 min lockout, correctly positioned"
 
-    # account stack: safe to append, all account modules run in order. this
-    # line belongs in common-account (or password-auth on RHEL), not in
-    # common-password where the account phase is never evaluated.
+    # account stack: safe to append, all account modules run in order.
     if [[ $DRY -eq 0 ]]; then
       if [[ "$pwfile" == /etc/pam.d/common-password ]]; then
         sed -i '/^[[:space:]]*account[[:space:]]*required[[:space:]]*pam_faillock\.so[[:space:]]*$/d' "$pwfile"
@@ -1586,8 +1977,8 @@ FL
     fi
   fi
 
-  # --- umask everywhere ---
-  step "umask"
+  # --- umask + idle timeout everywhere ---
+  step "umask + idle shell timeout"
   if [[ $DRY -eq 0 ]]; then
     for f in /etc/profile /etc/bash.bashrc /etc/login.defs; do
       [[ -f "$f" ]] && sed -i -E 's|^[[:space:]]*umask[[:space:]]+[0-9]+|umask 027|' "$f"
@@ -1595,12 +1986,16 @@ FL
     grep -q '^umask 027' /etc/profile || printf '\numask 027\n' >>/etc/profile
     [[ -f /etc/bash.bashrc ]] && { grep -q '^umask 027' /etc/bash.bashrc || printf '\numask 027\n' >>/etc/bash.bashrc; }
     mkdir -p /etc/profile.d
-    printf '# cbptlinux.sh\numask 027\n' >/etc/profile.d/99-cbptlinux-umask.sh
+    cat >/etc/profile.d/99-cbptlinux-umask.sh <<'UM'
+# cbptlinux.sh
+umask 027
+case "$-" in *i*) TMOUT=900; readonly TMOUT; export TMOUT ;; esac
+UM
     chmod 644 /etc/profile.d/99-cbptlinux-umask.sh
   else
-    say "[dry-run] umask 027 in profile files"
+    say "[dry-run] umask 027 + TMOUT=900 in profile files"
   fi
-  ok "umask 027 applied"
+  ok "umask 027 + idle timeout applied"
   finding "PERM-UMASK" "Passwords" "PASS" "umask 027"
 
   # core dumps
@@ -1620,9 +2015,19 @@ LIM
     fi
   fi
 
-  # verify the stack still parses
-  if [[ $DRY -eq 0 ]] && command -v pam-auth-update >/dev/null 2>&1; then
-    DEBIAN_FRONTEND=noninteractive pam-auth-update --package >/dev/null 2>&1 || true
+  # verify referenced pam_*.so modules exist on disk (do NOT re-run pam-auth-update
+  # after manual edits, since --package can overwrite our faillock/pwhistory wiring)
+  if [[ $DRY -eq 0 ]]; then
+    local mod missing_mod=0
+    while read -r mod; do
+      [[ -z "$mod" ]] && continue
+      if [[ ! -f "/lib/x86_64-linux-gnu/security/$mod" && ! -f "/lib64/security/$mod" && ! -f "/lib/security/$mod" ]]; then
+        warn "PAM module referenced in stack is missing on disk: $mod"
+        missing_mod=1
+      fi
+    done < <(grep -oE 'pam_[a-zA-Z0-9_]+\.so' "$pwfile" "$authfile" 2>/dev/null | sort -u)
+    (( missing_mod )) && finding "PAM-MODCHECK" "Passwords" "FAIL" "missing pam_*.so module referenced in PAM stack" \
+      "Restore from ${pwfile}.cbptlinuxbak-$STAMP or install the missing PAM module."
   fi
   warn "TEST YOUR LOGIN IN A SECOND SESSION BEFORE YOU CLOSE THIS ONE."
 }
@@ -1637,16 +2042,31 @@ do_ssh() {
 
   backup_file "$cfg"
 
-  # prefer a drop-in: cleaner, survives package updates, easy to revert
+  # prefer a drop-in that sorts FIRST (00-*) because OpenSSH uses first-match-wins.
   local dropin=/etc/ssh/sshd_config.d target="$cfg"
   if grep -qE '^\s*Include\s+/etc/ssh/sshd_config\.d' "$cfg" 2>/dev/null; then
-    [[ $DRY -eq 0 ]] && mkdir -p "$dropin"; target="$dropin/99-cbptlinux.conf"
+    [[ $DRY -eq 0 ]] && mkdir -p "$dropin"
+    target="$dropin/00-cbptlinux.conf"
   else
     if ! grep -q '^Include' "$cfg"; then
       [[ $DRY -eq 0 ]] && mkdir -p "$dropin"
-      if [[ $DRY -eq 0 ]]; then printf 'Include /etc/ssh/sshd_config.d/*.conf\n' >>"$cfg"; fi
-      target="$dropin/99-cbptlinux.conf"
+      if [[ $DRY -eq 0 ]]; then
+        local _sshtmp; _sshtmp="$(mktemp)"
+        { printf 'Include /etc/ssh/sshd_config.d/*.conf\n'; cat "$cfg"; } >"$_sshtmp" && cat "$_sshtmp" >"$cfg"
+        rm -f "$_sshtmp"
+      fi
+      target="$dropin/00-cbptlinux.conf"
     fi
+  fi
+  [[ $DRY -eq 0 && -f "$dropin/99-cbptlinux.conf" && "$target" != "$dropin/99-cbptlinux.conf" ]] && rm -f "$dropin/99-cbptlinux.conf"
+  if [[ -d "$dropin" ]]; then
+    local _di
+    for _di in "$dropin"/*.conf; do
+      [[ -f "$_di" && "$_di" != "$target" ]] || continue
+      if grep -qiE '^[[:space:]]*(PermitRootLogin[[:space:]]+yes|PermitEmptyPasswords[[:space:]]+yes|X11Forwarding[[:space:]]+yes)' "$_di" 2>/dev/null; then
+        warn "conflicting insecure setting in $_di -- review or remove it"
+      fi
+    done
   fi
 
   local -A SSHD=(
@@ -1693,6 +2113,12 @@ do_ssh() {
     esac
     ensure_line "$target" "^[[:space:]]*#?[[:space:]]*${k}[[:space:]]" "${k} ${SSHD[$k]}"
   done
+  # also mirror top scored directives in main sshd_config so file-grepping scorers pass
+  if [[ "$target" != "$cfg" ]]; then
+    for k in PermitRootLogin PermitEmptyPasswords X11Forwarding Protocol MaxAuthTries LogLevel; do
+      ensure_line "$cfg" "^[[:space:]]*#?[[:space:]]*${k}[[:space:]]" "${k} ${SSHD[$k]}"
+    done
+  fi
   ensure_line "$target" "^[[:space:]]*#?[[:space:]]*Ciphers[[:space:]]"          "Ciphers ${CIPHERS}"
   ensure_line "$target" "^[[:space:]]*#?[[:space:]]*MACs[[:space:]]"             "MACs ${MACS}"
   ensure_line "$target" "^[[:space:]]*#?[[:space:]]*KexAlgorithms[[:space:]]"    "KexAlgorithms ${KEX}"
@@ -1789,7 +2215,7 @@ BANNER
   else
     err "sshd -t FAILED. Restoring $cfg from backup."
     sshd -t
-    cp -a "$BKDIR/files/etc_sshd_config" "$cfg" 2>/dev/null
+    cp -a "$BKDIR/files/etc_ssh_sshd_config" "$cfg" 2>/dev/null
     [[ -f "$target" && "$target" != "$cfg" ]] && rm -f "$target"
     finding "SSH-RELOAD" "SSH" "FAIL" "sshd config rejected, rolled back" \
       "Read the sshd -t error above. Usually an unknown keyword for that openssh version."
@@ -1806,11 +2232,20 @@ do_firewall() {
   banner "FIREWALL"
   [[ $PARANOID -eq 1 ]] && { warn "paranoid: firewall untouched"; return; }
 
+  if [[ "$PKG" == "apt" ]] && ! command -v ufw >/dev/null 2>&1; then
+    pkg_install ufw 2>/dev/null
+  fi
+
   local fw=""
   command -v ufw >/dev/null 2>&1 && [[ -d /etc/ufw ]] && fw="ufw"
   if [[ -z "$fw" ]] && systemctl is-active firewalld >/dev/null 2>&1; then fw="firewalld"; fi
   if [[ -z "$fw" ]] && command -v nft >/dev/null 2>&1; then fw="nft"; fi
   [[ -z "$fw" ]] && command -v iptables >/dev/null 2>&1 && fw="iptables"
+
+  local ssh_conn_port=""
+  if [[ -n "${SSH_CONNECTION:-}" ]]; then
+    read -r _ _ _ ssh_conn_port _ <<<"$SSH_CONNECTION"
+  fi
 
   case "$fw" in
     ufw)
@@ -1821,13 +2256,14 @@ do_firewall() {
       act ufw default deny incoming
       act ufw default allow outgoing
       if [[ $DRY -eq 0 ]]; then
+        [[ "$ssh_conn_port" =~ ^[0-9]+$ ]] && ufw allow "${ssh_conn_port}/tcp" >/dev/null 2>&1 && say "  preserved active SSH port $ssh_conn_port"
         local p
         while read -r laddr; do
           p="${laddr##*:}"
           [[ "$p" =~ ^[0-9]+$ ]] || continue
           case "$p" in
             22|80|443) ufw allow "$p" >/dev/null 2>&1 && say "  allowed $p" ;;
-            21|23|69|111|135|139|445|512|513|514|1433|3306|5900|6667) warn "  NOT opening insecure port $p" ;;
+            21|23|69|110|111|135|139|143|445|512|513|514|993|995|1337|1433|2049|3128|3306|4444|5555|5900|5901|6667|6668|6669|12345|31337) warn "  NOT opening insecure port $p" ;;
             *) ufw allow "$p" >/dev/null 2>&1 && say "  allowed $p (verify against README)" ;;
           esac
         done < <(ss -tlnH 2>/dev/null | awk '{print $4}' | sort -u)
@@ -1874,17 +2310,20 @@ do_firewall() {
         iptables -F; iptables -X
         iptables -A INPUT -i lo -j ACCEPT
         iptables -A OUTPUT -o lo -j ACCEPT
+        iptables -A INPUT -s 127.0.0.0/8 ! -i lo -j DROP
         iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
         iptables -A INPUT -p icmp --icmp-type echo-request -m limit --limit 1/s -j ACCEPT
         iptables -A INPUT -p tcp --dport 22 -m conntrack --ctstate NEW -m limit --limit 6/min -j ACCEPT
+        [[ "$ssh_conn_port" =~ ^[0-9]+$ && "$ssh_conn_port" != "22" ]] && \
+          iptables -A INPUT -p tcp --dport "$ssh_conn_port" -m conntrack --ctstate NEW -j ACCEPT
         local p
         while read -r laddr proto; do
           p="${laddr##*:}"
           [[ "$p" =~ ^[0-9]+$ ]] || continue
           [[ "$p" == 22 ]] && continue
-          case "$p" in 21|23|69|111|135|139|445|512|513|514|1433|3306|5900|6667) warn "  NOT opening insecure port $p"; continue;; esac
-          iptables -I INPUT 4 -p tcp --dport "$p" -m conntrack --ctstate NEW -j ACCEPT
-          iptables -I INPUT 4 -p udp --dport "$p" -j ACCEPT
+          case "$p" in 21|23|69|110|111|135|139|143|445|512|513|514|993|995|1337|1433|2049|3128|3306|4444|5555|5900|5901|6667|6668|6669|12345|31337) warn "  NOT opening insecure port $p"; continue;; esac
+          iptables -I INPUT 5 -p tcp --dport "$p" -m conntrack --ctstate NEW -j ACCEPT
+          iptables -I INPUT 5 -p udp --dport "$p" -j ACCEPT
           say "  opened $p (verify against README)"
         done < <(ss -tulpnH 2>/dev/null | awk '{print $5,$1}' | sort -u)
         iptables -A INPUT -m limit --limit 5/min -j LOG --log-prefix "cbptlinux-DROP: " --log-level 4
@@ -1917,15 +2356,17 @@ do_services() {
   [[ $PARANOID -eq 1 ]] && { warn "paranoid: services untouched"; return; }
   command -v systemctl >/dev/null 2>&1 || warn "no systemd, sysvinit paths will be partial"
 
-  # safe to disable basically everywhere
-  local safe_off="telnet telnetd.socket openbsd-inetd inetd xinetd rsh.socket rlogin.socket \
-                  rexec.socket rpcbind rpcbind.socket avahi-daemon bluetooth cups-browsed \
+  # safe to disable basically everywhere (FTP moved to interactive/agg_off so critical FTP isn't killed blindly)
+  local safe_off="telnet telnetd.socket telnet.socket openbsd-inetd inetd xinetd rsh.socket rlogin rlogin.socket \
+                  rexec rexec.socket ypserv rpcbind rpcbind.socket avahi-daemon bluetooth cups-browsed \
                   nfs-server nfs-kernel-server whoopsie apport modemmanager \
-                  snmpd tftpd tftpd-hpa vsftpd proftpd talk talkd finger \
+                  snmpd tftpd tftpd-hpa talk talkd finger \
                   spice-vdagent spice-webdavd"
-  # only with --aggressive (could be a critical service)
+  # could be a critical service -> ask/confirm or --aggressive
   local agg_off="apache2 httpd nginx lighttpd mysql mariadb mysqld postgresql \
-                 named bind9 samba smbd nmbd slapd dovecot exim4 sendmail \
+                 named bind9 samba smbd nmbd slapd dovecot dovecot.socket exim4 sendmail \
+                 vsftpd proftpd pure-ftpd squid squid3 courier-pop courier-pop-ssl qpopper popa3d cyrus-imapd \
+                 xrdp x11vnc vncserver tightvncserver isc-dhcp-server \
                  docker containerd libvirtd cups"
 
   local s st
@@ -1963,20 +2404,55 @@ do_services() {
       fi
     done
   else
-    finding "SVC-AGG" "Services" "INFO" "web/db/mail/samba services left alone" \
+    # even in safe mode, prompt on commonly scored unwanted servers if interactive
+    local maybe_off="vsftpd proftpd pure-ftpd squid squid3 dovecot dovecot.socket xrdp x11vnc"
+    for s in $maybe_off; do
+      is_kept_service "$s" && continue
+      systemctl list-unit-files 2>/dev/null | grep -qE "^${s}\.(service|socket)" || continue
+      st="$(systemctl is-active "$s" 2>/dev/null)"
+      [[ "$st" == "active" ]] || continue
+      if [[ -t 0 ]] && ask "'$s' is active. Stop+disable '$s'? (Say NO if the README lists it as a critical service)"; then
+        act systemctl stop "$s"
+        act systemctl disable "$s"
+        finding "SVC-$s" "Services" "PASS" "$s stopped+disabled by operator"
+        change "service:$s" "$st" "disabled"
+      else
+        finding "SVC-$s" "Services" "WARN" "$s is active (check README -- disable if unauthorized, harden if critical)"
+      fi
+    done
+    finding "SVC-AGG" "Services" "INFO" "remaining web/db/mail/samba services left alone" \
       "Re-run with --aggressive if the README confirms none of them are critical. Otherwise HARDEN their configs instead of stopping them (apps module)."
   fi
 
   # things that should be running
-  for s in rsyslog systemd-journald cron crond auditd sshd; do
+  for s in rsyslog systemd-journald cron crond auditd sshd apparmor; do
     if systemctl list-unit-files 2>/dev/null | grep -qE "^${s}\.service"; then
       act systemctl enable "$s"
       act systemctl start "$s"
       st="$(systemctl is-active "$s" 2>/dev/null)"
       [[ "$st" == "active" ]] && finding "SVC-ON-$s" "Services" "PASS" "$s active+enabled" \
-                              || finding "SVC-ON-$s" "Services" "WARN" "$s = $st" "systemctl status $s -- a dead logging or audit daemon is a scored item."
+                              || finding "SVC-ON-$s" "Services" "WARN" "$s = $st" "systemctl status $s -- a dead logging, audit, or MAC daemon is a scored item."
     fi
   done
+
+  # AppArmor profile enforcement (best effort)
+  if command -v aa-enforce >/dev/null 2>&1 && [[ -d /etc/apparmor.d ]]; then
+    if [[ $DRY -eq 0 ]]; then
+      aa-enforce /etc/apparmor.d/* >/dev/null 2>&1 || true
+    else
+      say "[dry-run] aa-enforce /etc/apparmor.d/*"
+    fi
+  fi
+
+  # mask Ctrl-Alt-Del reboot shortcut
+  if command -v systemctl >/dev/null 2>&1; then
+    act systemctl mask ctrl-alt-del.target >/dev/null 2>&1
+    finding "SVC-CAD" "Services" "PASS" "ctrl-alt-del.target masked"
+  fi
+  if [[ -f /etc/init/control-alt-delete.conf ]] && [[ $DRY -eq 0 ]]; then
+    backup_file /etc/init/control-alt-delete.conf
+    sed -i 's/^\s*exec.*/exec false/' /etc/init/control-alt-delete.conf 2>/dev/null
+  fi
 
   # leftover rc.local
   if [[ -f /etc/rc.local ]]; then
@@ -2001,9 +2477,19 @@ do_packages() {
       # a broken sources.list is itself a scored vuln and blocks everything else
       if [[ -f /etc/apt/sources.list ]]; then
         backup_file /etc/apt/sources.list
-        if grep -RIl 'deb cdrom' /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null | grep -q .; then
-          finding "PKG-SOURCES" "Updates" "WARN" "a sources file contains a cdrom: line" \
-            "Comment out the cdrom line: sed -i 's/^deb cdrom/#deb cdrom/' <file>  -- then apt-get update."
+        if grep -RIl '^[[:space:]]*deb[[:space:]]+cdrom:' /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null | grep -q .; then
+          if [[ $DRY -eq 0 ]]; then
+            local _sf
+            while IFS= read -r _sf; do
+              [[ -f "$_sf" ]] || continue
+              backup_file "$_sf"
+              sed -i -E 's|^([[:space:]]*deb[[:space:]]+cdrom:)|#cbptlinux# \1|' "$_sf"
+              ok "commented out cdrom: line in $_sf"
+            done < <(grep -RIl '^[[:space:]]*deb[[:space:]]+cdrom:' /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null)
+          else
+            say "[dry-run] comment out deb cdrom: lines in apt sources"
+          fi
+          finding "PKG-SOURCES" "Updates" "PASS" "cdrom: apt source lines commented out"
         fi
         if fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; then
           finding "PKG-LOCK" "Updates" "WARN" "dpkg lock held" "ps aux | grep apt -- a stuck apt breaks the whole update chain and graders notice."
@@ -2020,10 +2506,23 @@ do_packages() {
           DEBIAN_FRONTEND=noninteractive apt-get -y autoremove 2>&1 | tail -5
           finding "PKG-UPGRADE" "Updates" "PASS" "full upgrade applied"
         else
-          # at minimum: security updates
-          DEBIAN_FRONTEND=noninteractive apt-get -y -o Dpkg::Options::=--force-confdef install --only-upgrade \
-            $(apt-get -s upgrade 2>/dev/null | grep -E '^Inst' | grep -i secur | awk '{print $2}' | head -80) >/dev/null 2>&1
-          finding "PKG-UPGRADE" "Updates" "INFO" "security-only upgrade attempted" \
+          # security updates (only invoke apt-get install if there are security packages!)
+          local sec_pkgs
+          sec_pkgs="$(apt-get -s upgrade 2>/dev/null | grep -E '^Inst' | grep -i secur | awk '{print $2}' | head -80 | tr '\n' ' ')"
+          if [[ -n "${sec_pkgs// /}" ]]; then
+            DEBIAN_FRONTEND=noninteractive apt-get -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold install --only-upgrade $sec_pkgs >/dev/null 2>&1
+          fi
+          # also targeted upgrade of frequently scored server/browser apps if already installed
+          local key_apps="" ka
+          for ka in openssh-server vsftpd chromium chromium-browser firefox firefox-esr sudo openssl \
+                    apache2 nginx samba mysql-server mariadb-server postgresql bind9 postfix curl bash libssl3; do
+            dpkg -s "$ka" >/dev/null 2>&1 && key_apps="$key_apps $ka"
+          done
+          if [[ -n "${key_apps// /}" ]]; then
+            say "upgrading key installed apps:$key_apps"
+            DEBIAN_FRONTEND=noninteractive apt-get -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold install --only-upgrade $key_apps >/dev/null 2>&1 || true
+          fi
+          finding "PKG-UPGRADE" "Updates" "INFO" "security + key-app upgrades attempted" \
             "Run --aggressive for a full upgrade. unpatched packages are scored; so is a broken apt."
         fi
       else
@@ -2040,16 +2539,27 @@ do_packages() {
         act $mgr -y --security upgrade
         finding "PKG-UPGRADE" "Updates" "INFO" "security-only upgrade attempted"
       fi
+      if [[ "$mgr" == "dnf" ]]; then
+        pkg_install dnf-automatic 2>/dev/null
+        if [[ -f /etc/dnf/automatic.conf && $DRY -eq 0 ]]; then
+          backup_file /etc/dnf/automatic.conf
+          ensure_line /etc/dnf/automatic.conf '^[[:space:]]*#?[[:space:]]*apply_updates' 'apply_updates = yes'
+          ensure_line /etc/dnf/automatic.conf '^[[:space:]]*#?[[:space:]]*download_updates' 'download_updates = yes'
+          act systemctl enable --now dnf-automatic.timer >/dev/null 2>&1 || true
+        fi
+      fi
       ;;
     zypper) act zypper --non-interactive refresh; act zypper --non-interactive patch ;;
     pacman) act pacman -Sy; [[ $AGGRESSIVE -eq 1 ]] && act pacman -Su --noconfirm ;;
   esac
 
-  # automatic security updates (apt)
+  # automatic security updates (apt) -- write BOTH 20auto-upgrades AND 10periodic,
+  # and ensure -security origins are active in 50unattended-upgrades.
   if [[ "$PKG" == "apt" ]]; then
     pkg_install unattended-upgrades 2>/dev/null
     if [[ -d /etc/apt/apt.conf.d ]]; then
       backup_file /etc/apt/apt.conf.d/20auto-upgrades
+      backup_file /etc/apt/apt.conf.d/10periodic
       if [[ $DRY -eq 0 ]]; then
         cat >/etc/apt/apt.conf.d/20auto-upgrades <<'AU'
 APT::Periodic::Update-Package-Lists "1";
@@ -2058,17 +2568,24 @@ APT::Periodic::Download-Upgradeable-Packages "1";
 APT::Periodic::AutocleanInterval "7";
 AU
         chmod 644 /etc/apt/apt.conf.d/20auto-upgrades
-        ok "unattended-upgrades configured"
+        cp -f /etc/apt/apt.conf.d/20auto-upgrades /etc/apt/apt.conf.d/10periodic
+        chmod 644 /etc/apt/apt.conf.d/10periodic
+        if [[ -f /etc/apt/apt.conf.d/50unattended-upgrades ]]; then
+          backup_file /etc/apt/apt.conf.d/50unattended-upgrades
+          sed -i -E 's|^[[:space:]]*//[[:space:]]*("\$\{distro_id\}[: ]\$\{distro_codename\}-security";)|\t\1|; s|^[[:space:]]*//[[:space:]]*("origin=Debian,codename=\$\{distro_codename\}-security,label=Debian-Security";)|\t\1|' /etc/apt/apt.conf.d/50unattended-upgrades 2>/dev/null
+        fi
+        ok "unattended-upgrades (20auto-upgrades + 10periodic + 50unattended-upgrades) configured"
       else
-        say "[dry-run] write /etc/apt/apt.conf.d/20auto-upgrades"
+        say "[dry-run] write 20auto-upgrades + 10periodic + tune 50unattended-upgrades"
       fi
-      finding "PKG-AUTO" "Updates" "PASS" "unattended-upgrades enabled"
+      finding "PKG-AUTO" "Updates" "PASS" "unattended-upgrades daily check + security auto-install enabled"
     fi
   fi
 
   # remove the insecure legacy daemons
-  local purge="telnet telnetd rsh-server rsh-client rexec ypserv tftpd tftpd-hpa talk talkd \
-               finger fingerd xinetd openbsd-inetd"
+  local purge="telnet telnetd telnetd-ssl inetutils-telnet inetutils-telnetd \
+               rsh-server rsh-client rlogin rexec ypserv nis tftpd tftpd-hpa talk talkd \
+               inetutils-talk inetutils-talkd finger fingerd xinetd openbsd-inetd inetutils-inetd"
   local present="" p
   for p in $purge; do pkg_has "$p" 2>/dev/null && present="$present $p"; done
   if [[ -n "$present" ]]; then
@@ -2077,6 +2594,31 @@ AU
     pkg_remove $present
   else
     finding "PKG-INSECURE" "Software" "PASS" "no legacy insecure daemons installed"
+  fi
+
+  # interactive purge helper for detected prohibited packages (from recon)
+  if [[ -s "$EVID/72-prohibited-packages.txt" && -t 0 && $DRY -eq 0 ]]; then
+    local bad_list
+    bad_list="$(tr '\n' ' ' <"$EVID/72-prohibited-packages.txt")"
+    if [[ -n "${bad_list// /}" ]]; then
+      warn "prohibited software detected during recon: $bad_list"
+      if ask "Interactively review & purge these detected packages one-by-one?"; then
+        local bp
+        while IFS= read -r bp; do
+          [[ -z "$bp" ]] && continue
+          if ask "  Purge package '$bp'?"; then
+            case "$PKG" in
+              apt)    DEBIAN_FRONTEND=noninteractive apt-get purge -y "$bp" >/dev/null 2>&1 && ok "purged $bp" ;;
+              dnf)    dnf remove -y "$bp" >/dev/null 2>&1 && ok "removed $bp" ;;
+              yum)    yum remove -y "$bp" >/dev/null 2>&1 && ok "removed $bp" ;;
+              zypper) zypper --non-interactive remove "$bp" >/dev/null 2>&1 && ok "removed $bp" ;;
+              pacman) pacman -Rns --noconfirm "$bp" >/dev/null 2>&1 && ok "removed $bp" ;;
+            esac
+            change "pkg:$bp" "installed" "purged"
+          fi
+        done <"$EVID/72-prohibited-packages.txt"
+      fi
+    fi
   fi
 }
 
@@ -2088,6 +2630,7 @@ do_sysctl() {
   [[ $PARANOID -eq 1 ]] && { warn "paranoid: sysctl untouched"; return; }
 
   local f=/etc/sysctl.d/99-cyberpatriot.conf
+  local fz=/etc/sysctl.d/99-zzz-cyberpatriot.conf
   [[ $DRY -eq 0 ]] && mkdir -p /etc/sysctl.d
   [[ -f /etc/sysctl.conf ]] && backup_file /etc/sysctl.conf
 
@@ -2127,12 +2670,20 @@ net.ipv4.conf.all.arp_announce = 2
 net.ipv4.conf.all.bootp_relay = 0
 net.ipv4.conf.all.proxy_arp = 0
 net.ipv4.tcp_rfc1337 = 1
+net.ipv4.tcp_timestamps = 0
 net.ipv4.tcp_fin_timeout = 15
 net.ipv4.tcp_keepalive_time = 1800
 net.ipv4.tcp_keepalive_probes = 5
 net.ipv4.tcp_keepalive_intvl = 15
 net.ipv6.conf.all.accept_ra = 0
 net.ipv6.conf.default.accept_ra = 0
+net.ipv6.conf.all.autoconf = 0
+net.ipv6.conf.default.autoconf = 0
+net.ipv6.conf.all.dad_transmits = 0
+net.ipv6.conf.default.router_solicitations = 0
+net.ipv6.conf.default.accept_ra_rtr_pref = 0
+net.ipv6.conf.default.accept_ra_pinfo = 0
+net.ipv6.conf.default.accept_ra_defrtr = 0
 net.ipv6.conf.all.max_addresses = 1
 
 # ---- kernel ----
@@ -2144,6 +2695,7 @@ kernel.yama.ptrace_scope = 1
 kernel.core_uses_pid = 1
 kernel.sysrq = 0
 kernel.unprivileged_bpf_disabled = 1
+net.core.bpf_jit_harden = 2
 kernel.kexec_load_disabled = 1
 
 # ---- fs ----
@@ -2154,9 +2706,28 @@ fs.protected_regular = 2
 fs.suid_dumpable = 0
 SYSCTL
     chmod 644 "$f"
-    ok "wrote $f"
+    # also mirror into 99-zzz-cyberpatriot.conf so Ubuntu/Debian's 99-sysctl.conf -> /etc/sysctl.conf cannot override us
+    cp -f "$f" "$fz" && chmod 644 "$fz"
+    # and sync top scored keys directly into /etc/sysctl.conf so file-grepping scorers also pass
+    if [[ -f /etc/sysctl.conf ]]; then
+      ensure_line /etc/sysctl.conf '^[[:space:]]*#?[[:space:]]*net\.ipv4\.ip_forward[[:space:]]*=' 'net.ipv4.ip_forward = 0'
+      ensure_line /etc/sysctl.conf '^[[:space:]]*#?[[:space:]]*net\.ipv4\.tcp_syncookies[[:space:]]*=' 'net.ipv4.tcp_syncookies = 1'
+      ensure_line /etc/sysctl.conf '^[[:space:]]*#?[[:space:]]*net\.ipv4\.tcp_rfc1337[[:space:]]*=' 'net.ipv4.tcp_rfc1337 = 1'
+      ensure_line /etc/sysctl.conf '^[[:space:]]*#?[[:space:]]*net\.ipv4\.conf\.all\.rp_filter[[:space:]]*=' 'net.ipv4.conf.all.rp_filter = 1'
+      ensure_line /etc/sysctl.conf '^[[:space:]]*#?[[:space:]]*net\.ipv4\.conf\.all\.accept_redirects[[:space:]]*=' 'net.ipv4.conf.all.accept_redirects = 0'
+      ensure_line /etc/sysctl.conf '^[[:space:]]*#?[[:space:]]*net\.ipv4\.conf\.all\.send_redirects[[:space:]]*=' 'net.ipv4.conf.all.send_redirects = 0'
+      ensure_line /etc/sysctl.conf '^[[:space:]]*#?[[:space:]]*net\.ipv4\.conf\.all\.accept_source_route[[:space:]]*=' 'net.ipv4.conf.all.accept_source_route = 0'
+      ensure_line /etc/sysctl.conf '^[[:space:]]*#?[[:space:]]*net\.ipv4\.icmp_echo_ignore_broadcasts[[:space:]]*=' 'net.ipv4.icmp_echo_ignore_broadcasts = 1'
+      ensure_line /etc/sysctl.conf '^[[:space:]]*#?[[:space:]]*kernel\.randomize_va_space[[:space:]]*=' 'kernel.randomize_va_space = 2'
+    fi
+    ok "wrote $f and $fz"
   else
-    say "[dry-run] write $f"
+    say "[dry-run] write $f and $fz"
+  fi
+
+  # /etc/host.conf anti-spoof
+  if [[ -f /etc/host.conf ]]; then
+    ensure_line /etc/host.conf '^[[:space:]]*#?[[:space:]]*nospoof[[:space:]]' 'nospoof on'
   fi
 
   # IP forwarding: if this box is meant to be a router (README), do not kill it
@@ -2320,6 +2891,8 @@ do_perms() {
   setperm /etc/rc.local 750 root root
   setperm /etc/exports 644 root root
   setperm /etc/ftpusers 644 root root
+  setperm /etc/securetty 600 root root
+  setperm /etc/host.conf 644 root root
   setperm /var/log/wtmp 664 root utmp
   setperm /var/log/btmp 660 root utmp
   setperm /var/log/lastlog 664 root utmp
@@ -2372,30 +2945,33 @@ do_perms() {
   fi
   finding "PERM-TMP" "Permissions" "PASS" "/tmp,/var/tmp,/dev/shm = 1777"
 
-  # dangerous SUID: strip from shells/editors/interpreters that are not distro-default
-  local strip="nmap vim vim.basic vim.tiny nano less more man gdb python python2 python3 perl ruby php \
-               socat nc ncat tcpdump strace ltrace find awk sed cp mv tar rsync"
-  local s removed=0
-  for s in $strip; do
-    if [[ $DRY -eq 0 ]]; then
-      while IFS= read -r p; do
-        [[ -z "$p" ]] && continue
+  # dangerous SUID: single-pass find matched against dangerous binaries
+  local strip="nmap vim vim.basic vim.tiny vi nano emacs less more man gdb python python2 python2.7 python3 python3.9 python3.10 python3.11 perl ruby php php-cgi lua \
+               socat nc nc.openbsd ncat netcat tcpdump strace ltrace find awk gawk mawk sed cp mv dd tar zip unzip gzip rsync scp ssh bash sh dash zsh ksh"
+  local strip_rx="^($(echo "$strip" | tr -s ' ' '|'))$"
+  local p removed=0
+  if [[ $DRY -eq 0 ]]; then
+    while IFS= read -r p; do
+      [[ -z "$p" ]] && continue
+      if [[ "$(basename "$p")" =~ $strip_rx ]]; then
         chmod u-s "$p" 2>/dev/null && { removed=$((removed+1)); change "suid:$p" "4755" "0755"; warn "  stripped SUID: $p"; }
-      done < <(find / -xdev -type f -name "$s" -perm -4000 -print 2>/dev/null)
-    else
-      say "[dry-run] SUID strip on $s"
-    fi
-  done
+      fi
+    done < <(find / -xdev \( -path /proc -o -path /sys -o -path /run -o -path /dev -o -path "$EVID" -o -path "$BKROOT" \) -prune -o -type f -perm -4000 -print 2>/dev/null)
+  else
+    say "[dry-run] single-pass SUID strip on dangerous binaries"
+  fi
   (( removed > 0 )) && finding "PERM-SUID-STRIP" "Permissions" "PASS" "stripped SUID from $removed dangerous binary(ies)" \
                     || finding "PERM-SUID-STRIP" "Permissions" "PASS" "no dangerous SUID binaries found"
 
-  # unowned
-  local uo; uo="$(find / -xdev \( -path /proc -o -path /sys -o -path /run \) -prune -o \( -nouser -o -nogroup \) -print 2>/dev/null | head -500 | wc -l)"
+  # unowned (single pass)
+  local uo_tmp; uo_tmp="$(mktemp)"
+  find / -xdev \( -path /proc -o -path /sys -o -path /run \) -prune -o \( -nouser -o -nogroup \) -print 2>/dev/null | head -500 >"$uo_tmp"
+  local uo; uo="$(wc -l <"$uo_tmp")"
   if (( uo > 0 )) && [[ $DRY -eq 0 ]]; then
-    find / -xdev \( -path /proc -o -path /sys -o -path /run \) -prune -o \( -nouser -o -nogroup \) -print0 2>/dev/null | \
-      head -c 100000 | xargs -0 -r chown root:root 2>/dev/null
-    finding "PERM-UNOWNED-FIX" "Permissions" "PASS" "chowned ~$uo unowned file(s) to root:root"
+    tr '\n' '\0' <"$uo_tmp" | xargs -0 -r chown root:root 2>/dev/null
+    finding "PERM-UNOWNED-FIX" "Permissions" "PASS" "chowned $uo unowned file(s) to root:root"
   fi
+  rm -f "$uo_tmp"
 
   # SELinux relabel if enforcing
   if command -v getenforce >/dev/null 2>&1 && [[ "$(getenforce 2>/dev/null)" != "Disabled" ]]; then
@@ -2887,18 +3463,39 @@ MY
     step "vsftpd"
     backup_file "$fc"
     ensure_line "$fc" '^[[:space:]]*#?[[:space:]]*anonymous_enable'   'anonymous_enable=NO'
+    ensure_line "$fc" '^[[:space:]]*#?[[:space:]]*anon_upload_enable' 'anon_upload_enable=NO'
     ensure_line "$fc" '^[[:space:]]*#?[[:space:]]*local_enable'       'local_enable=YES'
     ensure_line "$fc" '^[[:space:]]*#?[[:space:]]*chroot_local_user'   'chroot_local_user=YES'
+    ensure_line "$fc" '^[[:space:]]*#?[[:space:]]*allow_writeable_chroot' 'allow_writeable_chroot=YES'
     ensure_line "$fc" '^[[:space:]]*#?[[:space:]]*ssl_enable'         'ssl_enable=YES'
+    ensure_line "$fc" '^[[:space:]]*#?[[:space:]]*allow_anon_ssl'     'allow_anon_ssl=NO'
     ensure_line "$fc" '^[[:space:]]*#?[[:space:]]*force_local_data_ssl' 'force_local_data_ssl=YES'
     ensure_line "$fc" '^[[:space:]]*#?[[:space:]]*force_local_logins_ssl' 'force_local_logins_ssl=YES'
     ensure_line "$fc" '^[[:space:]]*#?[[:space:]]*xferlog_enable'      'xferlog_enable=YES'
     ensure_line "$fc" '^[[:space:]]*#?[[:space:]]*ls_recurse_enable'   'ls_recurse_enable=NO'
+    ensure_line "$fc" '^[[:space:]]*#?[[:space:]]*ascii_upload_enable' 'ascii_upload_enable=NO'
+    ensure_line "$fc" '^[[:space:]]*#?[[:space:]]*ascii_download_enable' 'ascii_download_enable=NO'
     ensure_line "$fc" '^[[:space:]]*#?[[:space:]]*idle_session_timeout' 'idle_session_timeout=600'
     ensure_line "$fc" '^[[:space:]]*#?[[:space:]]*banner_file'         'banner_file=/etc/issue.net'
+    if [[ -t 0 && $DRY -eq 0 ]] && ask "vsftpd: Does the README require local FTP users to log in as anonymous/guest (guest_enable=YES)?"; then
+      ensure_line "$fc" '^[[:space:]]*#?[[:space:]]*guest_enable'   'guest_enable=YES'
+      ensure_line "$fc" '^[[:space:]]*#?[[:space:]]*guest_username' 'guest_username=ftp'
+      finding "APP-FTP-GUEST" "Apps" "PASS" "vsftpd: guest_enable=YES, guest_username=ftp"
+    else
+      finding "APP-FTP-GUEST" "Apps" "INFO" "vsftpd guest_enable left as-is" \
+        "If the scoring/README asks that 'FTP local users must log in as anonymous', add guest_enable=YES and guest_username=ftp to $fc and restart vsftpd."
+    fi
     finding "APP-FTP" "Apps" "PASS" "vsftpd: anon off, chroot, TLS forced, logging on"
     act systemctl restart vsftpd
   done
+
+  # ---- Squid / Dovecot presence hints ----
+  [[ -f /etc/squid/squid.conf || -f /etc/squid3/squid.conf ]] && \
+    finding "APP-SQUID" "Apps" "WARN" "Squid proxy config found" \
+      "Squid proxy is frequently an unauthorized service. Stop+disable+purge squid unless required by README."
+  [[ -d /etc/dovecot ]] && \
+    finding "APP-DOVECOT" "Apps" "WARN" "Dovecot mail/POP3/IMAP config found" \
+      "POP3/IMAP is frequently an unauthorized service. Stop+disable+purge dovecot unless required by README."
 
   # ---- Samba ----
   local sc=/etc/samba/smb.conf
@@ -3041,22 +3638,28 @@ do_baseline() {
 do_verify() {
   banner "VERIFY"
 
-  # identity perms
+  # identity perms (no looser than target mode, so RHEL 000 shadow also passes)
   local f want got
   while read -r f want; do
     [[ -e "$f" ]] || continue
     got="$(stat -c '%a' "$f" 2>/dev/null)"
-    if [[ "$got" == "$want" ]]; then finding "VER-PERM-$(basename "$f")" "Verify" "PASS" "$f = $got"
-    else finding "VER-PERM-$(basename "$f")" "Verify" "FAIL" "$f = $got, want $want"; fi
+    if [[ "$got" =~ ^[0-7]{3,4}$ ]] && (( (8#${got: -3} & ~8#$want) == 0 )); then
+      finding "VER-PERM-$(basename "$f")" "Verify" "PASS" "$f = $got (<= $want)"
+    else
+      finding "VER-PERM-$(basename "$f")" "Verify" "FAIL" "$f = $got, want no looser than $want"
+    fi
   done < <(printf '%s\n' "/etc/passwd 644" "/etc/group 644" "/etc/shadow 640" "/etc/gshadow 640" \
                          "/etc/sudoers 440" "/etc/ssh/sshd_config 600" "/etc/crontab 644")
 
-  # uid0 / empty pw
-  local u0 ep
+  # uid0 / empty pw / privileged primary GID / nopasswdlogin
+  local u0 ep npw
   u0="$(awk -F: '$3==0 && $1!="root"{print $1}' /etc/passwd | tr '\n' ' ')"
   [[ -z "$u0" ]] && finding "VER-UID0" "Verify" "PASS" "no extra UID 0" || finding "VER-UID0" "Verify" "FAIL" "extra UID0: $u0"
   ep="$(awk -F: '($2==""){print $1}' /etc/shadow | tr '\n' ' ')"
   [[ -z "$ep" ]] && finding "VER-NOPASS" "Verify" "PASS" "no empty passwords" || finding "VER-NOPASS" "Verify" "FAIL" "empty passwords: $ep"
+  npw="$(getent group nopasswdlogin 2>/dev/null | cut -d: -f4)"
+  [[ -z "$npw" ]] && finding "VER-NOPASSWDLOGIN" "Verify" "PASS" "nopasswdlogin group empty" \
+                  || finding "VER-NOPASSWDLOGIN" "Verify" "FAIL" "nopasswdlogin has members: $npw"
 
   # login.defs
   local kv k v
@@ -3067,11 +3670,26 @@ do_verify() {
                         || finding "VER-$k" "Verify" "FAIL" "$k=$got (want $v)"
   done
 
-  # pwquality
+  # pwquality + PAM checks (nullok, lockout, password history)
   if [[ -f /etc/security/pwquality.conf ]]; then
     local ml; ml="$(grep -E '^\s*minlen' /etc/security/pwquality.conf | awk '{print $3}')"
     [[ "$ml" -ge 14 ]] 2>/dev/null && finding "VER-PWQ" "Verify" "PASS" "pwquality minlen=$ml" \
                                    || finding "VER-PWQ" "Verify" "FAIL" "pwquality minlen=$ml"
+  fi
+  if grep -REq 'nullok(_secure)?' /etc/pam.d/common-auth /etc/pam.d/common-password /etc/pam.d/system-auth /etc/pam.d/password-auth 2>/dev/null; then
+    finding "VER-PAM-NULLOK" "Verify" "FAIL" "nullok still present in PAM stack"
+  else
+    finding "VER-PAM-NULLOK" "Verify" "PASS" "no nullok in PAM auth/password stacks"
+  fi
+  if grep -REq 'pam_(faillock|tally2)\.so' /etc/pam.d/common-auth /etc/pam.d/system-auth /etc/pam.d/password-auth 2>/dev/null; then
+    finding "VER-PAM-LOCKOUT" "Verify" "PASS" "PAM account lockout configured"
+  else
+    finding "VER-PAM-LOCKOUT" "Verify" "FAIL" "no pam_faillock/pam_tally2 in PAM auth stack"
+  fi
+  if grep -REq '(pam_pwhistory\.so|pam_unix\.so.*remember=)' /etc/pam.d/common-password /etc/pam.d/system-auth /etc/pam.d/password-auth 2>/dev/null; then
+    finding "VER-PAM-HIST" "Verify" "PASS" "PAM password history configured"
+  else
+    finding "VER-PAM-HIST" "Verify" "FAIL" "no password history (remember=/pam_pwhistory) in PAM"
   fi
 
   # ssh -- read the EFFECTIVE config, not the file
@@ -3101,7 +3719,8 @@ do_verify() {
   # sysctl spot checks
   for kv in "net.ipv4.ip_forward 0" "net.ipv4.conf.all.accept_redirects 0" "net.ipv4.conf.all.send_redirects 0" \
             "net.ipv4.conf.all.accept_source_route 0" "net.ipv4.conf.all.log_martians 1" "net.ipv4.conf.all.rp_filter 1" \
-            "net.ipv4.tcp_syncookies 1" "kernel.randomize_va_space 2" "kernel.dmesg_restrict 1" \
+            "net.ipv4.tcp_syncookies 1" "net.ipv4.tcp_rfc1337 1" "net.ipv4.icmp_echo_ignore_broadcasts 1" \
+            "net.ipv4.icmp_ignore_bogus_error_responses 1" "kernel.randomize_va_space 2" "kernel.dmesg_restrict 1" \
             "kernel.kptr_restrict 2" "fs.protected_symlinks 1" "fs.protected_hardlinks 1" "fs.suid_dumpable 0"; do
     local k="${kv%% *}"; local v="${kv##* }"
     local got; got="$(sysctl_get "$k")"
@@ -3110,6 +3729,11 @@ do_verify() {
     elif [[ "$got" == "$v" ]]; then finding "VER-$k" "Verify" "PASS" "$k=$got"
     else finding "VER-$k" "Verify" "FAIL" "$k=$got (want $v)" "sysctl -w $k=$v  -- and confirm it is in /etc/sysctl.d/99-cyberpatriot.conf so it survives a reboot."; fi
   done
+  if [[ -f /etc/host.conf ]]; then
+    grep -Eq '^[[:space:]]*nospoof[[:space:]]+on' /etc/host.conf 2>/dev/null && \
+      finding "VER-HOSTCONF" "Verify" "PASS" "/etc/host.conf nospoof on" || \
+      finding "VER-HOSTCONF" "Verify" "FAIL" "/etc/host.conf missing nospoof on"
+  fi
 
   # firewall
   local fwup=0
@@ -3130,7 +3754,17 @@ do_verify() {
   [[ "$um" == "0027" || "$um" == "027" ]] && finding "VER-UMASK" "Verify" "PASS" "umask=$um" \
                                           || finding "VER-UMASK" "Verify" "WARN" "umask=$um (want 0027)" "new shells need to source /etc/profile. log out and back in."
 
-  # auditd
+  # auto-updates (apt)
+  if [[ "$PKG" == "apt" ]]; then
+    if grep -qE 'Update-Package-Lists\s+"1"' /etc/apt/apt.conf.d/20auto-upgrades /etc/apt/apt.conf.d/10periodic 2>/dev/null && \
+       grep -qE 'Unattended-Upgrade\s+"1"' /etc/apt/apt.conf.d/20auto-upgrades /etc/apt/apt.conf.d/10periodic 2>/dev/null; then
+      finding "VER-AUTOUPD" "Verify" "PASS" "APT daily update check + unattended security upgrades enabled"
+    else
+      finding "VER-AUTOUPD" "Verify" "FAIL" "APT daily auto-update / unattended-upgrade not enabled"
+    fi
+  fi
+
+  # auditd & AppArmor & ctrl-alt-del
   if command -v auditctl >/dev/null 2>&1; then
     local n; n="$(auditctl -l 2>/dev/null | wc -l)"
     if (( n > 10 )); then
@@ -3145,6 +3779,14 @@ do_verify() {
       finding "VER-AUDITD" "Verify" "FAIL" "auditd is not running" \
         "systemctl enable --now auditd  -- note some images need 'audit=1' on the kernel command line (edit /etc/default/grub, then update-grub) before auditd will collect anything."
     fi
+  fi
+  if command -v aa-status >/dev/null 2>&1; then
+    systemctl is-active apparmor >/dev/null 2>&1 && finding "VER-APPARMOR" "Verify" "PASS" "apparmor active" \
+                                                 || finding "VER-APPARMOR" "Verify" "WARN" "apparmor not active"
+  fi
+  if command -v systemctl >/dev/null 2>&1; then
+    [[ "$(systemctl is-enabled ctrl-alt-del.target 2>/dev/null)" == "masked" ]] && \
+      finding "VER-CAD" "Verify" "PASS" "ctrl-alt-del.target masked"
   fi
 
   # logging
@@ -3162,7 +3804,7 @@ do_verify() {
   while read -r laddr; do
     p="${laddr##*:}"
     case "$p" in
-      23|21|69|111|512|513|514) finding "VER-PORT-$p" "Verify" "FAIL" "port $p still listening" "stop + mask the service, then confirm with ss -tulpn." ;;
+      23|21|69|110|111|512|513|514|995|3128|4444|5900|31337) finding "VER-PORT-$p" "Verify" "FAIL" "port $p still listening" "stop + mask the service, then confirm with ss -tulpn (ignore if README requires it)." ;;
     esac
   done < <(ss -tulpnH 2>/dev/null | awk '{print $5}' | sort -u)
 
